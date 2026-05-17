@@ -7,29 +7,38 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/seakee/cpa-manager/usage-service/internal/collector"
 	"github.com/seakee/cpa-manager/usage-service/internal/config"
+	apikeyaliassvc "github.com/seakee/cpa-manager/usage-service/internal/service/apikeyalias"
+	managerconfigsvc "github.com/seakee/cpa-manager/usage-service/internal/service/managerconfig"
+	modelpricesvc "github.com/seakee/cpa-manager/usage-service/internal/service/modelprice"
+	panelsvc "github.com/seakee/cpa-manager/usage-service/internal/service/panel"
+	proxysvc "github.com/seakee/cpa-manager/usage-service/internal/service/proxy"
+	setupsvc "github.com/seakee/cpa-manager/usage-service/internal/service/setup"
+	usagesvc "github.com/seakee/cpa-manager/usage-service/internal/service/usage"
 	"github.com/seakee/cpa-manager/usage-service/internal/store"
-	"github.com/seakee/cpa-manager/usage-service/internal/usage"
 )
 
 //go:embed web/management.html
 var embeddedPanel embed.FS
 
 type Server struct {
-	cfg       config.Config
-	store     *store.Store
-	collector *collector.Manager
-	startedAt int64
+	cfg                  config.Config
+	store                *store.Store
+	collector            *collector.Manager
+	startedAt            int64
+	setupService         *setupsvc.Service
+	managerConfigService *managerconfigsvc.Service
+	usageService         *usagesvc.Service
+	modelPriceService    *modelpricesvc.Service
+	apiKeyAliasService   *apikeyaliassvc.Service
+	proxyService         *proxysvc.Service
+	panelService         *panelsvc.Service
 }
 
 type setupSource string
@@ -87,11 +96,20 @@ type apiKeyAliasesRequest struct {
 }
 
 func New(cfg config.Config, store *store.Store, collector *collector.Manager) *Server {
+	startedAt := time.Now().UnixMilli()
+	managerConfigService := managerconfigsvc.New(cfg, store, collector)
 	return &Server{
-		cfg:       cfg,
-		store:     store,
-		collector: collector,
-		startedAt: time.Now().UnixMilli(),
+		cfg:                  cfg,
+		store:                store,
+		collector:            collector,
+		startedAt:            startedAt,
+		setupService:         setupsvc.New(cfg, store, collector, managerConfigService, startedAt, serviceID),
+		managerConfigService: managerConfigService,
+		usageService:         usagesvc.New(store),
+		modelPriceService:    modelpricesvc.New(store, &modelPriceSyncURL),
+		apiKeyAliasService:   apikeyaliassvc.New(store),
+		proxyService:         proxysvc.New(managerConfigService),
+		panelService:         panelsvc.New(cfg.PanelPath, embeddedPanel),
 	}
 }
 
@@ -154,17 +172,12 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	setup, ok, err := s.resolveSetup(r.Context())
+	info, err := s.setupService.Info(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"service":    serviceID,
-		"mode":       "embedded",
-		"startedAt":  s.startedAt,
-		"configured": ok && setup.CPAUpstreamURL != "" && setup.ManagementKey != "",
-	})
+	writeJSON(w, http.StatusOK, info)
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -175,7 +188,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeIfConfigured(w, r) {
 		return
 	}
-	events, deadLetters, err := s.store.Counts(r.Context())
+	events, deadLetters, err := s.usageService.Counts(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -198,26 +211,12 @@ func (s *Server) handleManagerConfig(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		cfg, source, _, err := s.resolveManagerConfigWithSource(r.Context())
+		response, err := s.managerConfigService.Get(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		var cpaUsage *cpaUsageConfig
-		if cfg.CPAConnection.CPABaseURL != "" && cfg.CPAConnection.ManagementKey != "" {
-			if usageCfg, err := fetchCPAUsageConfig(
-				r.Context(),
-				cfg.CPAConnection.CPABaseURL,
-				cfg.CPAConnection.ManagementKey,
-			); err == nil {
-				cpaUsage = &usageCfg
-			}
-		}
-		writeJSON(w, http.StatusOK, managerConfigResponse{
-			Config:   cfg,
-			Source:   string(source),
-			CPAUsage: cpaUsage,
-		})
+		writeJSON(w, http.StatusOK, response)
 	case http.MethodPut:
 		var req struct {
 			Config store.ManagerConfig `json:"config"`
@@ -226,78 +225,12 @@ func (s *Server) handleManagerConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		current, source, _, err := s.resolveManagerConfigWithSource(r.Context())
+		response, err := s.managerConfigService.Update(r.Context(), req.Config)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeError(w, managerConfigErrorStatus(err), err)
 			return
 		}
-		next := s.mergeSubmittedManagerConfig(current, req.Config)
-		if source == setupSourceEnv && managerConfigConnectionDiffers(current, next) {
-			writeError(w, http.StatusConflict, errors.New("connection setup is managed by environment variables"))
-			return
-		}
-		if next.CPAConnection.CPABaseURL != "" || next.CPAConnection.ManagementKey != "" {
-			if next.CPAConnection.CPABaseURL == "" || next.CPAConnection.ManagementKey == "" {
-				writeError(w, http.StatusBadRequest, errors.New("cpaBaseUrl and managementKey are required"))
-				return
-			}
-			if err := validateManagementAPI(
-				r.Context(),
-				next.CPAConnection.CPABaseURL,
-				next.CPAConnection.ManagementKey,
-			); err != nil {
-				writeError(w, http.StatusBadGateway, err)
-				return
-			}
-			if managerCollectorEnabled(next) {
-				if err := validateCollectorAgainstCPA(r.Context(), next); err != nil {
-					writeError(w, http.StatusBadRequest, err)
-					return
-				}
-				if err := setCPAUsageStatisticsEnabled(
-					r.Context(),
-					next.CPAConnection.CPABaseURL,
-					next.CPAConnection.ManagementKey,
-					true,
-				); err != nil {
-					writeError(w, http.StatusBadGateway, err)
-					return
-				}
-			}
-		} else if managerCollectorEnabled(next) {
-			writeError(w, http.StatusBadRequest, errors.New("cpaBaseUrl and managementKey are required when request monitoring is enabled"))
-			return
-		}
-		if next.CPAConnection.CPABaseURL == "" || next.CPAConnection.ManagementKey == "" {
-			if err := s.store.SaveManagerConfig(r.Context(), next); err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
-			s.collector.Stop()
-			writeJSON(w, http.StatusOK, managerConfigResponse{
-				Config: next,
-				Source: string(setupSourceDB),
-			})
-			return
-		}
-		if err := s.store.SaveManagerConfig(r.Context(), next); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		setup := setupFromManagerConfig(next)
-		if err := s.store.SaveSetup(r.Context(), setup); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if managerCollectorEnabled(next) {
-			s.collector.Start(context.Background(), runtimeConfigFromManagerConfig(next))
-		} else {
-			s.collector.Stop()
-		}
-		writeJSON(w, http.StatusOK, managerConfigResponse{
-			Config: next,
-			Source: string(setupSourceDB),
-		})
+		writeJSON(w, http.StatusOK, response)
 	default:
 		methodNotAllowed(w)
 	}
@@ -308,108 +241,17 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	var req setupRequest
+	var req setupsvc.Request
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	req.CPAUpstreamURL = normalizeBaseURL(req.CPAUpstreamURL)
-	req.ManagementKey = strings.TrimSpace(req.ManagementKey)
-	req.CollectorMode = collectorMode(req.CollectorMode)
-	if req.Queue == "" {
-		req.Queue = s.cfg.Queue
-	}
-	if req.PopSide == "" {
-		req.PopSide = s.cfg.PopSide
-	}
-	req.PopSide = normalizePopSide(req.PopSide, s.cfg.PopSide)
-	req.BatchSize = positiveOrDefault(req.BatchSize, s.cfg.BatchSize, 100)
-	req.PollIntervalMS = positiveOrDefault(req.PollIntervalMS, int(s.cfg.PollInterval/time.Millisecond), 500)
-	req.QueryLimit = positiveOrDefault(req.QueryLimit, s.cfg.QueryLimit, 50000)
-	requestMonitoringEnabled := setupRequestMonitoringEnabled(req)
-	if req.CPAUpstreamURL == "" || req.ManagementKey == "" {
-		writeError(w, http.StatusBadRequest, errors.New("cpaBaseUrl and managementKey are required"))
+	result, err := s.setupService.Setup(r.Context(), req, r.Header.Get("Authorization"))
+	if err != nil {
+		writeError(w, setupErrorStatus(err), err)
 		return
 	}
-	managementAPIValidated := false
-	if existing, source, ok, err := s.resolveSetupWithSource(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	} else if source == setupSourceEnv && setupDiffers(existing, req) {
-		writeError(w, http.StatusConflict, errors.New("setup is managed by environment variables"))
-		return
-	} else if ok && existing.ManagementKey != "" &&
-		!authMatches(r, existing.ManagementKey) &&
-		req.ManagementKey != existing.ManagementKey {
-		if normalizeBaseURL(existing.CPAUpstreamURL) != req.CPAUpstreamURL {
-			writeError(w, http.StatusUnauthorized, errors.New("invalid management key for existing setup"))
-			return
-		}
-		if err := validateManagementAPI(r.Context(), req.CPAUpstreamURL, req.ManagementKey); err != nil {
-			writeError(w, http.StatusBadGateway, err)
-			return
-		}
-		managementAPIValidated = true
-	}
-	if !managementAPIValidated {
-		if err := validateManagementAPI(r.Context(), req.CPAUpstreamURL, req.ManagementKey); err != nil {
-			writeError(w, http.StatusBadGateway, err)
-			return
-		}
-	}
-	managerCfg := s.defaultManagerConfig()
-	if existingManagerCfg, _, ok, err := s.resolveManagerConfigWithSource(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	} else if ok {
-		managerCfg = existingManagerCfg
-	}
-	managerCfg.CPAConnection.CPABaseURL = req.CPAUpstreamURL
-	managerCfg.CPAConnection.ManagementKey = req.ManagementKey
-	managerCfg.Collector.Enabled = boolPtr(requestMonitoringEnabled)
-	managerCfg.Collector.CollectorMode = req.CollectorMode
-	managerCfg.Collector.Queue = req.Queue
-	managerCfg.Collector.PopSide = req.PopSide
-	managerCfg.Collector.BatchSize = req.BatchSize
-	managerCfg.Collector.PollIntervalMS = req.PollIntervalMS
-	managerCfg.Collector.QueryLimit = req.QueryLimit
-	managerCfg.Collector.TLSSkipVerify = req.TLSSkipVerify
-	if requestMonitoringEnabled {
-		if err := validateCollectorAgainstCPA(r.Context(), managerCfg); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-	}
-	ensureUsageStatisticsEnabled := requestMonitoringEnabled
-	if req.EnsureUsageStatisticsEnabled != nil {
-		ensureUsageStatisticsEnabled = requestMonitoringEnabled && *req.EnsureUsageStatisticsEnabled
-	}
-	if ensureUsageStatisticsEnabled {
-		if err := setCPAUsageStatisticsEnabled(r.Context(), req.CPAUpstreamURL, req.ManagementKey, true); err != nil {
-			writeError(w, http.StatusBadGateway, err)
-			return
-		}
-	}
-	setup := store.Setup{
-		CPAUpstreamURL: req.CPAUpstreamURL,
-		ManagementKey:  req.ManagementKey,
-		Queue:          req.Queue,
-		PopSide:        req.PopSide,
-	}
-	if err := s.store.SaveSetup(r.Context(), setup); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := s.store.SaveManagerConfig(r.Context(), managerCfg); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if requestMonitoringEnabled {
-		s.collector.Start(context.Background(), runtimeConfigFromManagerConfig(managerCfg))
-	} else {
-		s.collector.Stop()
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "upstream": setup.CPAUpstreamURL})
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleModelPrices(w http.ResponseWriter, r *http.Request) {
@@ -420,60 +262,36 @@ func (s *Server) handleModelPrices(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimRight(r.URL.Path, "/")
 	switch {
 	case path == "/v0/management/model-prices" && r.Method == http.MethodGet:
-		prices, err := s.store.LoadModelPrices(r.Context())
+		prices, err := s.modelPriceService.List(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"prices": prices})
 	case path == "/v0/management/model-prices" && r.Method == http.MethodPut:
-		var req modelPricesRequest
+		var req modelpricesvc.UpdateRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		if req.Prices == nil {
-			writeError(w, http.StatusBadRequest, errors.New("prices are required"))
-			return
-		}
-		if err := s.store.SaveModelPrices(r.Context(), req.Prices); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		prices, err := s.store.LoadModelPrices(r.Context())
+		prices, err := s.modelPriceService.Replace(r.Context(), req.Prices)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"prices": prices})
 	case path == "/v0/management/model-prices/sync" && r.Method == http.MethodPost:
-		var req modelPricesSyncRequest
+		var req modelpricesvc.SyncRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		remotePrices, skipped, err := fetchLiteLLMModelPrices(r.Context())
+		result, err := s.modelPriceService.SyncFromLiteLLM(r.Context(), req)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err)
+			writeError(w, modelPriceErrorStatus(err), err)
 			return
 		}
-		selectedPrices := selectModelPrices(remotePrices, req.Models)
-		result, err := s.store.UpsertSyncedModelPrices(r.Context(), selectedPrices)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		prices, err := s.store.LoadModelPrices(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"source":   modelPriceSyncSource,
-			"imported": result.Imported,
-			"skipped":  result.Skipped + skipped,
-			"prices":   prices,
-		})
+		writeJSON(w, http.StatusOK, result)
 	default:
 		methodNotAllowed(w)
 	}
@@ -488,35 +306,27 @@ func (s *Server) handleAPIKeyAliases(w http.ResponseWriter, r *http.Request) {
 	const basePath = "/v0/management/api-key-aliases"
 	switch {
 	case path == basePath && r.Method == http.MethodGet:
-		aliases, err := s.store.LoadAPIKeyAliases(r.Context())
+		aliases, err := s.apiKeyAliasService.List(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": aliases})
 	case path == basePath && r.Method == http.MethodPut:
-		var req apiKeyAliasesRequest
+		var req apikeyaliassvc.SaveRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		if req.Items == nil {
-			writeError(w, http.StatusBadRequest, errors.New("api key aliases are required"))
-			return
-		}
-		if err := s.store.UpsertAPIKeyAliases(r.Context(), req.Items); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		aliases, err := s.store.LoadAPIKeyAliases(r.Context())
+		aliases, err := s.apiKeyAliasService.Save(r.Context(), req.Items)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": aliases})
 	case strings.HasPrefix(path, basePath+"/") && r.Method == http.MethodDelete:
 		apiKeyHash := strings.TrimPrefix(path, basePath+"/")
-		if err := s.store.DeleteAPIKeyAlias(r.Context(), apiKeyHash); err != nil {
+		if err := s.apiKeyAliasService.Delete(r.Context(), apiKeyHash); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -664,12 +474,12 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 			s.handleUsageExport(w, r)
 			return
 		}
-		events, err := s.store.RecentEvents(r.Context(), s.cfg.QueryLimit)
+		payload, err := s.usageService.GetCompatibleUsage(r.Context(), s.cfg.QueryLimit)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, usage.BuildPayload(events))
+		writeJSON(w, http.StatusOK, payload)
 	case http.MethodPost:
 		if strings.HasSuffix(r.URL.Path, "/import") {
 			s.handleUsageImport(w, r)
@@ -682,7 +492,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUsageExport(w http.ResponseWriter, r *http.Request) {
-	data, err := s.store.ExportJSONL(r.Context())
+	data, err := s.usageService.Export(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -705,8 +515,12 @@ func (s *Server) handleUsageImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parsed, err := usage.ParseImportPayload(data)
+	result, parsed, err := s.usageService.Import(r.Context(), data)
 	if err != nil {
+		if parsed != nil && len(parsed.Events) > 0 {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error":       err.Error(),
 			"format":      parsed.Format,
@@ -716,21 +530,7 @@ func (s *Server) handleUsageImport(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-
-	result, err := s.store.InsertEvents(r.Context(), parsed.Events)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"format":      parsed.Format,
-		"added":       result.Inserted,
-		"skipped":     result.Skipped,
-		"total":       len(parsed.Events),
-		"failed":      parsed.Failed,
-		"unsupported": parsed.Unsupported,
-		"warnings":    parsed.Warnings,
-	})
+	writeJSON(w, http.StatusOK, result)
 }
 
 func isModelListProxyPath(path string) bool {
@@ -739,88 +539,15 @@ func isModelListProxyPath(path string) bool {
 }
 
 func (s *Server) handleModelListProxy(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		methodNotAllowed(w)
-		return
-	}
-	setup, ok, err := s.resolveSetup(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if !ok {
-		writeError(w, http.StatusPreconditionRequired, errors.New("usage service is not configured"))
-		return
-	}
-	target, err := url.Parse(setup.CPAUpstreamURL)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.Host = target.Host
-	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-		writeError(w, http.StatusBadGateway, err)
-	}
-	proxy.ServeHTTP(w, r)
+	s.proxyService.ProxyModelList(w, r, writeError, methodNotAllowed)
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
-	setup, ok, err := s.resolveSetup(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if !ok {
-		writeError(w, http.StatusPreconditionRequired, errors.New("usage service is not configured"))
-		return
-	}
-	if !authMatches(r, setup.ManagementKey) {
-		writeError(w, http.StatusUnauthorized, errors.New("invalid management key"))
-		return
-	}
-	target, err := url.Parse(setup.CPAUpstreamURL)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.Host = target.Host
-		req.Header.Set("Authorization", "Bearer "+setup.ManagementKey)
-	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-		writeError(w, http.StatusBadGateway, err)
-	}
-	proxy.ServeHTTP(w, r)
+	s.proxyService.ProxyManagement(w, r, writeError)
 }
 
 func (s *Server) handlePanel(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.PanelPath != "" {
-		if file, err := os.Open(s.cfg.PanelPath); err == nil {
-			defer file.Close()
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = io.Copy(w, file)
-			return
-		}
-	}
-	data, err := embeddedPanel.ReadFile("web/management.html")
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	w.Header().Set("Content-Type", mime.TypeByExtension(".html"))
-	_, _ = w.Write(data)
+	s.panelService.ServeManagementHTML(w, writeError)
 }
 
 func (s *Server) resolveSetup(ctx context.Context) (store.Setup, bool, error) {
@@ -1029,7 +756,7 @@ func setupRequestMonitoringEnabled(req setupRequest) bool {
 }
 
 func (s *Server) authorizeIfConfigured(w http.ResponseWriter, r *http.Request) bool {
-	setup, ok, err := s.resolveSetup(r.Context())
+	setup, ok, err := s.managerConfigService.ResolveSetup(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return false
@@ -1037,7 +764,7 @@ func (s *Server) authorizeIfConfigured(w http.ResponseWriter, r *http.Request) b
 	if !ok || setup.ManagementKey == "" {
 		return true
 	}
-	if authMatches(r, setup.ManagementKey) {
+	if managerconfigsvc.AuthHeaderMatches(r.Header.Get("Authorization"), setup.ManagementKey) {
 		return true
 	}
 	writeError(w, http.StatusUnauthorized, errors.New("invalid management key"))
@@ -1247,6 +974,50 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]any{"error": err.Error(), "code": usageServiceErrorCode(err)})
+}
+
+func setupErrorStatus(err error) int {
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "setup is managed by environment variables"):
+		return http.StatusConflict
+	case strings.Contains(message, "invalid management key for existing setup"):
+		return http.StatusUnauthorized
+	case strings.Contains(message, "cpaBaseUrl and managementKey are required"),
+		strings.Contains(message, "CPA redis-usage-queue-retention-seconds"),
+		strings.Contains(message, "pollIntervalMs must be less than or equal"):
+		return http.StatusBadRequest
+	case strings.Contains(message, "management API validation failed"),
+		strings.Contains(message, "enable CPA usage statistics failed"):
+		return http.StatusBadGateway
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+func managerConfigErrorStatus(err error) int {
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "connection setup is managed by environment variables"):
+		return http.StatusConflict
+	case strings.Contains(message, "cpaBaseUrl and managementKey are required"),
+		strings.Contains(message, "CPA redis-usage-queue-retention-seconds"),
+		strings.Contains(message, "pollIntervalMs must be less than or equal"):
+		return http.StatusBadRequest
+	case strings.Contains(message, "management API validation failed"),
+		strings.Contains(message, "management API config request failed"),
+		strings.Contains(message, "enable CPA usage statistics failed"):
+		return http.StatusBadGateway
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func modelPriceErrorStatus(err error) int {
+	if strings.Contains(err.Error(), "model price sync failed") {
+		return http.StatusBadGateway
+	}
+	return http.StatusInternalServerError
 }
 
 func methodNotAllowed(w http.ResponseWriter) {
