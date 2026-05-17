@@ -83,6 +83,21 @@ Usage Service
 
 Use this when CPA still auto-downloads and serves the panel. This mode is served by CPA, so it does not show the Usage Service-hosted setup wizard. Request monitoring is optional; when Usage Service is not deployed, the panel hides the request monitoring entry and direct visits to the monitoring page show a setup hint. To use request monitoring, log in to CPA first, deploy Usage Service separately, then open **Configuration -> CPA-Manager Configuration**, enable it, enter the Usage Service URL, and save.
 
+### Usage Service Backend
+
+The Go backend lives under the `github.com/seakee/cpa-manager-plus/usage-service` module. Its request path follows a layered shape:
+
+```text
+model -> repository -> service -> controller -> router
+```
+
+- `internal/model` defines persisted and API-facing data structures.
+- `internal/repository` owns SQLite access and schema migration while keeping the existing tables compatible.
+- `internal/service` contains setup, manager config, usage, model price, API key alias, proxy, panel, and collector lifecycle rules.
+- `internal/http/controller`, `internal/http/middleware`, and `internal/http/router` keep HTTP decoding, CORS/auth/recovery, Gin routing, and response writing at the edge.
+- `internal/httpapi` remains a compatibility wrapper for the current `cmd/cpa-manager` entrypoint.
+- `internal/worker` coordinates collector startup/restart/stop without changing the existing HTTP/RESP/auto queue consumers.
+
 ## Quick Start: Full Docker Mode
 
 ### Docker Hub Image
@@ -351,6 +366,8 @@ Usage Service:
 ```bash
 cd usage-service
 go test ./...
+go test -race ./...
+go vet ./...
 go run ./cmd/cpa-manager
 ```
 

@@ -83,6 +83,21 @@ Usage Service
 
 当你希望保留 CPA 自动下载并托管面板的机制时，使用这个方案。该模式由 CPA 托管页面，因此不会显示 Usage Service 托管面板的 setup wizard。请求监控是可选能力；如果没有部署 Usage Service，面板会自动隐藏请求监控入口，直接访问监控页时会提示先部署并配置 Usage Service。需要请求监控时，先登录 CPA，再单独部署 Usage Service，然后在面板的「配置面板 -> CPA-Manager 配置」中启用并填写地址。
 
+### Usage Service 后端
+
+Go 后端位于 `github.com/seakee/cpa-manager-plus/usage-service` 模块。请求链路按以下分层组织：
+
+```text
+model -> repository -> service -> controller -> router
+```
+
+- `internal/model` 定义持久化和 API 响应相关数据结构。
+- `internal/repository` 负责 SQLite 读写和 schema 迁移，并保持现有数据表兼容。
+- `internal/service` 承担 setup、CPA-Manager 配置、usage、模型价格、API Key 别名、代理、面板和 collector 生命周期等业务规则。
+- `internal/http/controller`、`internal/http/middleware` 和 `internal/http/router` 把 HTTP decode、CORS/auth/recovery、Gin 路由和响应写入限制在边界层。
+- `internal/httpapi` 保留为当前 `cmd/cpa-manager` 入口的兼容 wrapper。
+- `internal/worker` 负责 collector 启动、重启和停止，不改变现有 HTTP/RESP/auto 队列消费协议。
+
 ## 快速开始：完整 Docker 方案
 
 ### Docker Hub 镜像
@@ -351,6 +366,8 @@ Usage Service：
 ```bash
 cd usage-service
 go test ./...
+go test -race ./...
+go vet ./...
 go run ./cmd/cpa-manager
 ```
 
