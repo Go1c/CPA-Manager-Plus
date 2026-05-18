@@ -1035,7 +1035,7 @@ export function CodexInspectionPage() {
           </div>
 
           <div className={styles.statusActions}>
-            <Link to="/monitoring" className={styles.quickLink}>
+            <Link to="/auth-files" className={styles.quickLink}>
               <IconExternalLink size={14} />
               <span>{t('monitoring.codex_inspection_back')}</span>
             </Link>

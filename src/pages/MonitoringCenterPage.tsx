@@ -2923,7 +2923,7 @@ export function MonitoringCenterPage() {
 
         <div className={`${styles.actionGroup} ${styles.actionGroupNav}`}>
           <Link
-            to="/monitoring/codex-inspection"
+            to="/codex-inspection"
             className={`${styles.actionButton} ${styles.quickNavLink}`}
           >
             <IconChartLine size={16} />

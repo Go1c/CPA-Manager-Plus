@@ -16,6 +16,7 @@ import {
   IconSidebarAuthFiles,
   IconSidebarConfig,
   IconSidebarDashboard,
+  IconSidebarInspection,
   IconSidebarLogs,
   IconSidebarMonitor,
   IconSidebarOauth,
@@ -37,16 +38,19 @@ import { LANGUAGE_LABEL_KEYS, LANGUAGE_ORDER } from '@/utils/constants';
 import { isSupportedLanguage } from '@/utils/language';
 import type { Theme } from '@/types';
 
+const SIDEBAR_ICON_SIZE = 20;
+
 const sidebarIcons: Record<string, ReactNode> = {
-  dashboard: <IconSidebarDashboard size={18} />,
-  aiProviders: <IconSidebarProviders size={18} />,
-  authFiles: <IconSidebarAuthFiles size={18} />,
-  oauth: <IconSidebarOauth size={18} />,
-  quota: <IconSidebarQuota size={18} />,
-  monitoring: <IconSidebarMonitor size={18} />,
-  config: <IconSidebarConfig size={18} />,
-  logs: <IconSidebarLogs size={18} />,
-  system: <IconSidebarSystem size={18} />,
+  dashboard: <IconSidebarDashboard size={SIDEBAR_ICON_SIZE} />,
+  aiProviders: <IconSidebarProviders size={SIDEBAR_ICON_SIZE} />,
+  authFiles: <IconSidebarAuthFiles size={SIDEBAR_ICON_SIZE} />,
+  oauth: <IconSidebarOauth size={SIDEBAR_ICON_SIZE} />,
+  quota: <IconSidebarQuota size={SIDEBAR_ICON_SIZE} />,
+  codexInspection: <IconSidebarInspection size={SIDEBAR_ICON_SIZE} />,
+  monitoring: <IconSidebarMonitor size={SIDEBAR_ICON_SIZE} />,
+  config: <IconSidebarConfig size={SIDEBAR_ICON_SIZE} />,
+  logs: <IconSidebarLogs size={SIDEBAR_ICON_SIZE} />,
+  system: <IconSidebarSystem size={SIDEBAR_ICON_SIZE} />,
 };
 
 // Header action icons - smaller size for header buttons
@@ -83,14 +87,18 @@ const headerIcons = {
       <path d="m6 6 12 12" />
     </svg>
   ),
-  chevronLeft: (
+  sidebarCollapse: (
     <svg {...headerIconProps}>
-      <path d="m14 18-6-6 6-6" />
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M9 4v16" />
+      <path d="m16 9-3 3 3 3" />
     </svg>
   ),
-  chevronRight: (
+  sidebarExpand: (
     <svg {...headerIconProps}>
-      <path d="m10 6 6 6-6 6" />
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M9 4v16" />
+      <path d="m13 9 3 3-3 3" />
     </svg>
   ),
   language: (
@@ -118,35 +126,15 @@ const headerIcons = {
       <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z" />
     </svg>
   ),
-  whiteTheme: (
-    <svg {...headerIconProps}>
-      <circle cx="12" cy="12" r="7" />
-      <circle cx="12" cy="12" r="3" fill="currentColor" stroke="none" />
-    </svg>
-  ),
   autoTheme: (
     <svg {...headerIconProps}>
-      <defs>
-        <clipPath id="mainLayoutAutoThemeSunLeftHalf">
-          <rect x="0" y="0" width="12" height="24" />
-        </clipPath>
-      </defs>
-      <circle cx="12" cy="12" r="4" />
-      <circle
-        cx="12"
-        cy="12"
-        r="4"
-        clipPath="url(#mainLayoutAutoThemeSunLeftHalf)"
-        fill="currentColor"
-      />
-      <path d="M12 2v2" />
-      <path d="M12 20v2" />
-      <path d="M4.93 4.93l1.41 1.41" />
-      <path d="M17.66 17.66l1.41 1.41" />
-      <path d="M2 12h2" />
-      <path d="M20 12h2" />
-      <path d="M6.34 17.66l-1.41 1.41" />
-      <path d="M19.07 4.93l-1.41 1.41" />
+      <rect x="4" y="5" width="16" height="11" rx="2" />
+      <path d="M8 21h8" />
+      <path d="M12 16v5" />
+      <path d="M9 11a3 3 0 0 1 5.2-2" />
+      <path d="M14.5 7v2h-2" />
+      <path d="M15 11a3 3 0 0 1-5.2 2" />
+      <path d="M9.5 15v-2h2" />
     </svg>
   ),
   logout: (
@@ -158,56 +146,21 @@ const headerIcons = {
   ),
 };
 
-const THEME_CARDS: Array<{
-  key: Theme;
+const THEME_OPTIONS: Array<{
+  key: Exclude<Theme, 'light'>;
   labelKey: string;
-  colors: { bg: string; card: string; border: string; text: string; textMuted: string };
+  icon: ReactNode;
 }> = [
-  {
-    key: 'auto',
-    labelKey: 'theme.auto',
-    colors: {
-      bg: 'linear-gradient(135deg, #ffffff 0 50%, #111111 50% 100%)',
-      card: 'linear-gradient(135deg, #ffffff 0 50%, #1a1a1a 50% 100%)',
-      border: '#bdbdbd',
-      text: '#2d2a26',
-      textMuted: 'linear-gradient(135deg, #c9c9c9 0 50%, #5a5a5a 50% 100%)',
-    },
-  },
-  {
-    key: 'white',
-    labelKey: 'theme.white',
-    colors: {
-      bg: '#ffffff',
-      card: '#ffffff',
-      border: '#e5e5e5',
-      text: '#2d2a26',
-      textMuted: '#a29c95',
-    },
-  },
-  {
-    key: 'light',
-    labelKey: 'theme.light',
-    colors: {
-      bg: '#faf9f5',
-      card: '#f0eee8',
-      border: '#e3e1db',
-      text: '#2d2a26',
-      textMuted: '#a29c95',
-    },
-  },
-  {
-    key: 'dark',
-    labelKey: 'theme.dark',
-    colors: {
-      bg: '#151412',
-      card: '#1d1b18',
-      border: '#3a3530',
-      text: '#f6f4f1',
-      textMuted: '#9c958d',
-    },
-  },
+  { key: 'auto', labelKey: 'theme.auto', icon: headerIcons.autoTheme },
+  { key: 'white', labelKey: 'theme.white', icon: headerIcons.sun },
+  { key: 'dark', labelKey: 'theme.dark', icon: headerIcons.moon },
 ];
+
+type NavItem = {
+  path: string;
+  label: string;
+  icon: ReactNode;
+};
 
 export function MainLayout() {
   const { t } = useTranslation();
@@ -388,21 +341,44 @@ export function MainLayout() {
     });
   }, [fetchConfig]);
 
-  const navItems = [
-    { path: '/', label: t('nav.dashboard'), icon: sidebarIcons.dashboard },
-    { path: '/config', label: t('nav.config_management'), icon: sidebarIcons.config },
-    { path: '/ai-providers', label: t('nav.ai_providers'), icon: sidebarIcons.aiProviders },
-    { path: '/auth-files', label: t('nav.auth_files'), icon: sidebarIcons.authFiles },
-    { path: '/oauth', label: t('nav.oauth', { defaultValue: 'OAuth' }), icon: sidebarIcons.oauth },
-    { path: '/quota', label: t('nav.quota_management'), icon: sidebarIcons.quota },
+  const operationNavItems: NavItem[] = [
     ...(requestMonitoringAvailability.available
-      ? [{ path: '/monitoring', label: t('nav.monitoring_center'), icon: sidebarIcons.monitoring }]
+      ? [
+          {
+            path: '/monitoring',
+            label: t('nav.monitoring_center'),
+            icon: sidebarIcons.monitoring,
+          },
+        ]
       : []),
     ...(config?.loggingToFile
       ? [{ path: '/logs', label: t('nav.logs'), icon: sidebarIcons.logs }]
       : []),
-    { path: '/system', label: t('nav.system_info'), icon: sidebarIcons.system },
   ];
+  const navSections: NavItem[][] = [
+    [{ path: '/', label: t('nav.dashboard'), icon: sidebarIcons.dashboard }],
+    [
+      { path: '/config', label: t('nav.config_management'), icon: sidebarIcons.config },
+      { path: '/ai-providers', label: t('nav.ai_providers'), icon: sidebarIcons.aiProviders },
+    ],
+    [
+      { path: '/auth-files', label: t('nav.auth_files'), icon: sidebarIcons.authFiles },
+      {
+        path: '/oauth',
+        label: t('nav.oauth', { defaultValue: 'OAuth' }),
+        icon: sidebarIcons.oauth,
+      },
+      { path: '/quota', label: t('nav.quota_management'), icon: sidebarIcons.quota },
+      {
+        path: '/codex-inspection',
+        label: t('nav.codex_inspection'),
+        icon: sidebarIcons.codexInspection,
+      },
+    ],
+    operationNavItems,
+    [{ path: '/system', label: t('nav.system_info'), icon: sidebarIcons.system }],
+  ].filter((section) => section.length > 0);
+  const navItems = navSections.flat();
   const navOrder = navItems.map((item) => item.path);
   const getRouteOrder = (pathname: string) => {
     const trimmedPath =
@@ -486,14 +462,14 @@ export function MainLayout() {
       ? location.pathname.slice(0, -1)
       : location.pathname;
   const currentPath = normalizedLocationPath === '/dashboard' ? '/' : normalizedLocationPath;
+  const matchesNavPath = (itemPath: string, pathname: string) =>
+    itemPath === '/'
+      ? pathname === '/'
+      : pathname === itemPath || pathname.startsWith(`${itemPath}/`);
   const activeNavItem =
     [...navItems]
       .sort((a, b) => b.path.length - a.path.length)
-      .find((item) =>
-        item.path === '/'
-          ? currentPath === '/'
-          : currentPath === item.path || currentPath.startsWith(`${item.path}/`)
-      ) ?? navItems[0];
+      .find((item) => matchesNavPath(item.path, currentPath)) ?? navItems[0];
   const currentRouteLabel = activeNavItem?.label ?? fullBrandName;
 
   return (
@@ -517,8 +493,8 @@ export function MainLayout() {
               {sidebarOpen
                 ? headerIcons.close
                 : sidebarCollapsed
-                  ? headerIcons.chevronRight
-                  : headerIcons.chevronLeft}
+                  ? headerIcons.sidebarExpand
+                  : headerIcons.sidebarCollapse}
             </button>
 
             <nav
@@ -571,7 +547,6 @@ export function MainLayout() {
                       aria-checked={language === lang}
                     >
                       <span>{t(LANGUAGE_LABEL_KEYS[lang])}</span>
-                      {language === lang ? <span className="language-menu-check">✓</span> : null}
                     </button>
                   ))}
                 </div>
@@ -592,9 +567,7 @@ export function MainLayout() {
                   ? headerIcons.autoTheme
                   : theme === 'dark'
                     ? headerIcons.moon
-                    : theme === 'white'
-                      ? headerIcons.whiteTheme
-                      : headerIcons.sun}
+                    : headerIcons.sun}
               </Button>
               {themeMenuOpen && (
                 <div
@@ -602,66 +575,33 @@ export function MainLayout() {
                   role="menu"
                   aria-label={t('theme.switch')}
                 >
-                  {THEME_CARDS.map((tc) => (
+                  {THEME_OPTIONS.map((option) => (
                     <button
-                      key={tc.key}
+                      key={option.key}
                       type="button"
-                      className={`theme-card ${theme === tc.key ? 'active' : ''}`}
-                      onClick={() => handleThemeSelect(tc.key)}
+                      className={`theme-option ${theme === option.key ? 'active' : ''}`}
+                      onClick={() => handleThemeSelect(option.key)}
                       role="menuitemradio"
-                      aria-checked={theme === tc.key}
+                      aria-checked={theme === option.key}
+                      title={t(option.labelKey)}
+                      aria-label={t(option.labelKey)}
                     >
-                      <div
-                        className="theme-card-preview"
-                        style={{
-                          background: tc.colors.bg,
-                          border: `1px solid ${tc.colors.border}`,
-                        }}
-                      >
-                        <div
-                          className="theme-card-header"
-                          style={{
-                            background: tc.colors.card,
-                            borderBottom: `1px solid ${tc.colors.border}`,
-                          }}
-                        />
-                        <div className="theme-card-body">
-                          <div
-                            className="theme-card-sidebar"
-                            style={{
-                              background: tc.colors.card,
-                              borderRight: `1px solid ${tc.colors.border}`,
-                            }}
-                          />
-                          <div className="theme-card-content" style={{ background: tc.colors.bg }}>
-                            <div
-                              className="theme-card-line"
-                              style={{ background: tc.colors.textMuted }}
-                            />
-                            <div
-                              className="theme-card-line short"
-                              style={{ background: tc.colors.textMuted }}
-                            />
-                          </div>
-                        </div>
-                      </div>
-                      <span className="theme-card-label">{t(tc.labelKey)}</span>
+                      <span className="theme-option-icon">{option.icon}</span>
                     </button>
                   ))}
                 </div>
               )}
             </div>
 
-            <button
-              type="button"
-              className="avatar-wrapper"
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={logout}
               title={t('header.logout')}
+              aria-label={t('header.logout')}
             >
-              <span className="navbar-avatar">{abbrBrandName.charAt(0) || 'C'}</span>
-              <span className="user-name">{abbrBrandName}</span>
-              <span className="avatar-action">{headerIcons.logout}</span>
-            </button>
+              {headerIcons.logout}
+            </Button>
           </div>
         </div>
       </header>
@@ -690,18 +630,27 @@ export function MainLayout() {
           </div>
 
           <div className="nav-section">
-            {navItems.map((item) => (
-              <NavLink
-                key={item.path}
-                to={item.path}
-                end={item.path === '/'}
-                className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
-                onClick={() => setSidebarOpen(false)}
-                title={showSidebarLabels ? undefined : item.label}
-              >
-                <span className="nav-icon">{item.icon}</span>
-                {showSidebarLabels && <span className="nav-label">{item.label}</span>}
-              </NavLink>
+            {navSections.map((section, sectionIndex) => (
+              <div className="nav-menu-section" key={`nav-section-${sectionIndex}`}>
+                {sectionIndex > 0 && <div className="nav-menu-divider" aria-hidden="true" />}
+                {section.map((item) => (
+                  <NavLink
+                    key={item.path}
+                    to={item.path}
+                    end={item.path === '/'}
+                    className={({ isActive }) =>
+                      `nav-item ${
+                        isActive || matchesNavPath(item.path, currentPath) ? 'active' : ''
+                      }`
+                    }
+                    onClick={() => setSidebarOpen(false)}
+                    title={showSidebarLabels ? undefined : item.label}
+                  >
+                    <span className="nav-icon">{item.icon}</span>
+                    {showSidebarLabels && <span className="nav-label">{item.label}</span>}
+                  </NavLink>
+                ))}
+              </div>
             ))}
           </div>
         </aside>
