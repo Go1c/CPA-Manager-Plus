@@ -211,6 +211,195 @@ export interface DashboardSummaryParams {
   recentFailures?: number;
 }
 
+export interface MonitoringAnalyticsFilters {
+  models?: string[];
+  auth_indices?: string[];
+  api_key_hashes?: string[];
+  source_hashes?: string[];
+  include_failed?: boolean;
+  exclude_zero_token?: boolean;
+}
+
+export interface MonitoringAnalyticsEventsPageRequest {
+  limit?: number;
+  before_ms?: number | null;
+}
+
+export interface MonitoringAnalyticsInclude {
+  summary?: boolean;
+  timeline?: boolean;
+  hourly_distribution?: boolean;
+  model_share?: boolean;
+  channel_share?: boolean;
+  model_stats?: boolean;
+  failure_sources?: boolean;
+  task_buckets?: boolean;
+  recent_failures?: number;
+  events_page?: MonitoringAnalyticsEventsPageRequest;
+  granularity?: 'hour' | 'day' | string;
+}
+
+export interface MonitoringAnalyticsRequest {
+  from_ms: number;
+  to_ms: number;
+  now_ms?: number;
+  search_query?: string;
+  search_api_key_hash?: string;
+  filters?: MonitoringAnalyticsFilters;
+  include?: MonitoringAnalyticsInclude;
+}
+
+export interface MonitoringAnalyticsSummary {
+  total_calls: number;
+  success_calls: number;
+  failure_calls: number;
+  success_rate: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+  total_cost: number;
+  average_latency_ms: number | null;
+  zero_token_calls: number;
+  rpm_30m: number;
+  tpm_30m: number;
+  avg_daily_requests: number;
+  avg_daily_tokens: number;
+  approx_tasks: number;
+  approx_task_failures: number;
+  approx_task_success_rate: number;
+  zero_token_models: string[];
+}
+
+export interface MonitoringAnalyticsTimelinePoint {
+  bucket_ms: number;
+  label: string;
+  calls: number;
+  tokens: number;
+  success: number;
+  failure: number;
+}
+
+export interface MonitoringAnalyticsHourlyPoint {
+  hour: number;
+  calls: number;
+  tokens: number;
+}
+
+export interface MonitoringAnalyticsModelShareRow {
+  model: string;
+  calls: number;
+  tokens: number;
+  cost: number;
+}
+
+export interface MonitoringAnalyticsModelStat {
+  model: string;
+  calls: number;
+  success_calls: number;
+  failure_calls: number;
+  success_rate: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  total_tokens: number;
+  cost: number;
+}
+
+export interface MonitoringAnalyticsChannelShareRow {
+  auth_index: string;
+  calls: number;
+  success: number;
+  failure: number;
+  tokens: number;
+  cost: number;
+  average_latency_ms: number | null;
+}
+
+export interface MonitoringAnalyticsFailureSourceRow {
+  source_hash: string;
+  auth_index: string;
+  calls: number;
+  failure: number;
+  last_seen_ms: number;
+  average_latency_ms: number | null;
+}
+
+export interface MonitoringAnalyticsTaskBucketRow {
+  bucket_key: string;
+  total: number;
+  success: number;
+  failure: number;
+  first_ms: number;
+  last_ms: number;
+  source: string;
+  source_hash: string;
+  auth_index: string;
+  models: string[];
+  endpoints: string[];
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  total_tokens: number;
+  average_latency_ms: number | null;
+  max_latency_ms: number | null;
+}
+
+export interface MonitoringAnalyticsRecentFailure {
+  timestamp_ms: number;
+  model: string;
+  api_key_hash: string;
+  source_hash: string;
+  auth_index: string;
+  endpoint: string;
+  duration_ms: number | null;
+}
+
+export interface MonitoringAnalyticsEventRow {
+  event_hash: string;
+  timestamp_ms: number;
+  model: string;
+  endpoint: string;
+  method: string;
+  path: string;
+  auth_index: string;
+  source: string;
+  source_hash: string;
+  api_key_hash: string;
+  account_snapshot: string;
+  auth_label_snapshot: string;
+  auth_provider_snapshot: string;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+  latency_ms: number | null;
+  failed: boolean;
+}
+
+export interface MonitoringAnalyticsEventsResponse {
+  items: MonitoringAnalyticsEventRow[];
+  next_before_ms: number;
+  has_more: boolean;
+}
+
+export interface MonitoringAnalyticsResponse {
+  generated_at_ms: number;
+  granularity: 'hour' | 'day' | string;
+  summary?: MonitoringAnalyticsSummary;
+  timeline?: MonitoringAnalyticsTimelinePoint[];
+  hourly_distribution?: MonitoringAnalyticsHourlyPoint[];
+  model_share?: MonitoringAnalyticsModelShareRow[];
+  model_stats?: MonitoringAnalyticsModelStat[];
+  channel_share?: MonitoringAnalyticsChannelShareRow[];
+  failure_sources?: MonitoringAnalyticsFailureSourceRow[];
+  task_buckets?: MonitoringAnalyticsTaskBucketRow[];
+  recent_failures?: MonitoringAnalyticsRecentFailure[];
+  events?: MonitoringAnalyticsEventsResponse;
+}
+
 const USAGE_SERVICE_TIMEOUT_MS = 15 * 1000;
 const USAGE_SERVICE_TRANSFER_TIMEOUT_MS = 60 * 1000;
 export const USAGE_SERVICE_ID = 'cpa-manager-plus';
@@ -562,6 +751,26 @@ export const dashboardApi = {
           timeout: USAGE_SERVICE_TIMEOUT_MS,
           headers: authHeaders(managementKey),
           params: query,
+        }
+      );
+      return response.data;
+    });
+  },
+};
+
+export const monitoringAnalyticsApi = {
+  getAnalytics: async (
+    base: string,
+    managementKey: string | undefined,
+    request: MonitoringAnalyticsRequest
+  ): Promise<MonitoringAnalyticsResponse> => {
+    return withUsageServiceError(async () => {
+      const response = await axios.post<MonitoringAnalyticsResponse>(
+        buildUrl(base, '/v0/management/monitoring/analytics'),
+        request,
+        {
+          timeout: USAGE_SERVICE_TIMEOUT_MS,
+          headers: authHeaders(managementKey),
         }
       );
       return response.data;
