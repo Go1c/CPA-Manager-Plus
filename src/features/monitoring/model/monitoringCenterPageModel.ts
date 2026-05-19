@@ -1,19 +1,28 @@
 import type { TFunction } from 'i18next';
 import { requestCodexUsagePayload } from '@/services/api';
-import type { CodexUsagePayload } from '@/types';
+import type { AuthFileItem, CodexUsagePayload } from '@/types';
 import type {
   MonitoringAccountRow,
   MonitoringEventRow,
+  MonitoringSummary,
 } from '@/features/monitoring/hooks/useMonitoringData';
 import type { AccountSortKey } from '@/features/monitoring/accountOverviewState';
 import type {
   AccountQuotaEntry,
   AccountQuotaWindow,
 } from '@/features/monitoring/components/accountOverviewPresentation';
+import { formatPercent } from '@/features/monitoring/components/accountOverviewPresentation';
+import type { SummaryCardProps } from '@/features/monitoring/components/MonitoringShared';
 import type { MonitoringAccountQuotaTarget } from '@/features/monitoring/accountOverviewQuotaTargets';
 import { formatStatusWindowLabel } from '@/features/monitoring/model/statusWindow';
 import { buildCodexQuotaWindowInfos, normalizePlanType } from '@/utils/quota';
-import type { ModelPrice } from '@/utils/usage';
+import {
+  formatCompactNumber,
+  formatDurationMs,
+  formatUsd,
+  normalizeAuthIndex,
+  type ModelPrice,
+} from '@/utils/usage';
 
 export type StatusFilter = 'all' | 'success' | 'failed';
 
@@ -44,6 +53,11 @@ export type AccountOverviewColumn = {
   key: string;
   label: string;
   sortKey?: AccountSortKey;
+};
+
+export type MonitoringOption = {
+  value: string;
+  label: string;
 };
 
 export type PaginationState<T> = {
@@ -83,6 +97,244 @@ export const ensureSelectedOption = <T extends { value: string; label: string }>
   }
   return [...options, { value, label } as T];
 };
+
+const buildSortedValueOptions = (values: string[]): MonitoringOption[] =>
+  Array.from(new Set(values))
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right))
+    .map((value) => ({ value, label: value }));
+
+export const buildProviderOptions = (
+  rows: MonitoringEventRow[],
+  selectedProvider: string,
+  t: TFunction
+) =>
+  ensureSelectedOption(
+    [
+      { value: 'all', label: t('monitoring.filter_all_providers') },
+      ...buildSortedValueOptions(rows.map((row) => row.provider)),
+    ],
+    selectedProvider
+  );
+
+export const buildAccountOptions = (
+  rows: MonitoringAccountRow[],
+  selectedAccount: string,
+  t: TFunction
+) =>
+  ensureSelectedOption(
+    [
+      { value: 'all', label: t('monitoring.filter_all_accounts') },
+      ...Array.from(
+        new Map(rows.map((row) => [row.account, buildAccountOptionLabel(row)])).entries()
+      )
+        .sort((left, right) => left[1].localeCompare(right[1]))
+        .map(([value, label]) => ({ value, label })),
+    ],
+    selectedAccount
+  );
+
+export const buildModelOptions = (
+  rows: MonitoringEventRow[],
+  selectedModel: string,
+  t: TFunction
+) =>
+  ensureSelectedOption(
+    [
+      { value: 'all', label: t('monitoring.filter_all_models') },
+      ...buildSortedValueOptions(rows.map((row) => row.model)),
+    ],
+    selectedModel
+  );
+
+export const buildChannelOptions = (
+  rows: MonitoringEventRow[],
+  selectedChannel: string,
+  t: TFunction
+) =>
+  ensureSelectedOption(
+    [
+      { value: 'all', label: t('monitoring.filter_all_channels') },
+      ...buildSortedValueOptions(rows.map((row) => row.channel)),
+    ],
+    selectedChannel
+  );
+
+export const buildApiKeyOptions = (
+  rows: MonitoringEventRow[],
+  selectedApiKeyHash: string,
+  t: TFunction
+) => {
+  const optionMap = new Map<string, string>();
+  rows.forEach((row) => {
+    if (!row.apiKeyHash || optionMap.has(row.apiKeyHash)) return;
+    optionMap.set(row.apiKeyHash, row.apiKeyLabel || row.apiKeyMasked || row.apiKeyHash);
+  });
+
+  return ensureSelectedOption(
+    [
+      { value: 'all', label: t('monitoring.filter_all_api_keys') },
+      ...Array.from(optionMap.entries())
+        .sort((left, right) => left[1].localeCompare(right[1]))
+        .map(([value, label]) => ({ value, label })),
+    ],
+    selectedApiKeyHash,
+    selectedApiKeyHash
+  );
+};
+
+export const buildStatusOptions = (t: TFunction): MonitoringOption[] => [
+  { value: 'all', label: t('monitoring.filter_all_statuses') },
+  { value: 'success', label: t('monitoring.filter_status_success') },
+  { value: 'failed', label: t('monitoring.filter_status_failed') },
+];
+
+export const buildSyncPriceModels = (
+  rows: MonitoringEventRow[],
+  modelPrices: Record<string, ModelPrice>
+) =>
+  Array.from(new Set([...rows.map((row) => row.model), ...Object.keys(modelPrices)]))
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right));
+
+export const buildPriceModelOptions = (models: string[], t: TFunction): MonitoringOption[] => [
+  { value: '', label: t('usage_stats.model_price_select_placeholder') },
+  ...models.map((value) => ({ value, label: value })),
+];
+
+export const buildAuthFilesByAuthIndex = (authFiles: AuthFileItem[]) => {
+  const map = new Map<string, AuthFileItem>();
+  authFiles.forEach((file) => {
+    const authIndex = normalizeAuthIndex(file['auth_index'] ?? file.authIndex);
+    if (!authIndex || map.has(authIndex)) return;
+    map.set(authIndex, file);
+  });
+  return map;
+};
+
+export const buildAccountOverviewColumns = (t: TFunction): AccountOverviewColumn[] => [
+  { key: 'account', label: t('monitoring.account_overview_col_account') },
+  { key: 'status', label: t('monitoring.column_status') },
+  { key: 'total-calls', label: t('monitoring.total_calls'), sortKey: 'totalCalls' },
+  {
+    key: 'success-calls',
+    label: t('monitoring.account_overview_col_success'),
+    sortKey: 'successCalls',
+  },
+  {
+    key: 'failure-calls',
+    label: t('monitoring.account_overview_col_failure'),
+    sortKey: 'failureCalls',
+  },
+  { key: 'success-rate', label: t('monitoring.column_success_rate'), sortKey: 'successRate' },
+  { key: 'total-tokens', label: t('monitoring.total_tokens'), sortKey: 'totalTokens' },
+  {
+    key: 'estimated-cost',
+    label: t('monitoring.account_overview_col_cost'),
+    sortKey: 'totalCost',
+  },
+  {
+    key: 'latest-request-time',
+    label: t('monitoring.latest_request_time'),
+    sortKey: 'lastSeenAt',
+  },
+  { key: 'action', label: t('common.action') },
+];
+
+export const buildApiKeyOverviewColumns = (t: TFunction): AccountOverviewColumn[] => [
+  { key: 'api-key', label: t('monitoring.api_key_summary_col_key') },
+  { key: 'total-calls', label: t('monitoring.total_calls') },
+  { key: 'success-calls', label: t('monitoring.account_overview_col_success') },
+  { key: 'failure-calls', label: t('monitoring.account_overview_col_failure') },
+  { key: 'total-tokens', label: t('monitoring.total_tokens') },
+  { key: 'estimated-cost', label: t('monitoring.account_overview_col_cost') },
+  { key: 'latest-request-time', label: t('monitoring.latest_request_time') },
+];
+
+export const buildAccountSortOptions = (
+  columns: AccountOverviewColumn[],
+  t: TFunction
+): MonitoringOption[] => {
+  const prefix = t('monitoring.account_overview_sort_prefix');
+  return columns
+    .filter((column): column is AccountOverviewColumn & { sortKey: AccountSortKey } =>
+      Boolean(column.sortKey)
+    )
+    .map((column) => ({
+      value: column.sortKey,
+      label: `${prefix}${column.label}`,
+    }));
+};
+
+export const buildPrimarySummaryCards = ({
+  summary,
+  accountCount,
+  failedGroupCount,
+  hasPrices,
+  locale,
+  t,
+}: {
+  summary: MonitoringSummary;
+  accountCount: number;
+  failedGroupCount: number;
+  hasPrices: boolean;
+  locale: string;
+  t: TFunction;
+}): SummaryCardProps[] => [
+  {
+    label: t('monitoring.total_calls'),
+    value: formatCompactNumber(summary.totalCalls),
+    meta: `${accountCount} ${t('monitoring.accounts_suffix')}`,
+  },
+  {
+    label: t('monitoring.call_success_rate'),
+    value: formatPercent(summary.successRate),
+    meta: formatDurationMs(summary.averageLatencyMs, { locale }),
+    tone: summary.successRate >= 0.95 ? 'good' : summary.successRate >= 0.85 ? 'warn' : 'bad',
+  },
+  {
+    label: t('monitoring.failure_calls'),
+    value: formatCompactNumber(summary.failureCalls),
+    meta: `${failedGroupCount} ${t('monitoring.groups_suffix')}`,
+    tone: summary.failureCalls > 0 ? 'bad' : 'good',
+  },
+  {
+    label: t('monitoring.estimated_cost'),
+    value: hasPrices ? formatUsd(summary.totalCost) : '--',
+    meta: hasPrices ? t('monitoring.estimated_cost_hint') : t('monitoring.estimated_cost_missing'),
+    tone: hasPrices ? undefined : 'warn',
+  },
+];
+
+export const buildSecondarySummaryCards = (
+  summary: MonitoringSummary,
+  t: TFunction
+): SummaryCardProps[] => [
+  {
+    label: t('monitoring.total_tokens'),
+    value: formatCompactNumber(summary.totalTokens),
+    meta: `${t('monitoring.reasoning_tokens')} ${formatCompactNumber(summary.reasoningTokens)}`,
+    variant: 'secondary',
+  },
+  {
+    label: t('monitoring.input_tokens'),
+    value: formatCompactNumber(summary.inputTokens),
+    meta: `${t('monitoring.of_token_mix')} ${formatPercent(summary.totalTokens > 0 ? summary.inputTokens / summary.totalTokens : 0)}`,
+    variant: 'secondary',
+  },
+  {
+    label: t('monitoring.output_tokens'),
+    value: formatCompactNumber(summary.outputTokens),
+    meta: `${t('monitoring.of_token_mix')} ${formatPercent(summary.totalTokens > 0 ? summary.outputTokens / summary.totalTokens : 0)}`,
+    variant: 'secondary',
+  },
+  {
+    label: t('monitoring.cached_tokens'),
+    value: formatCompactNumber(summary.cachedTokens),
+    meta: `${t('monitoring.of_input_tokens')} ${formatPercent(summary.inputTokens > 0 ? summary.cachedTokens / summary.inputTokens : 0)}`,
+    variant: 'secondary',
+  },
+];
 
 export const isUsageImportFile = (file: File) => {
   const normalizedName = file.name.toLowerCase();

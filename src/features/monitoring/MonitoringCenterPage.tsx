@@ -53,18 +53,28 @@ import { MonitoringPriceModal } from '@/features/monitoring/components/Monitorin
 import { MonitoringStatusHeader } from '@/features/monitoring/components/MonitoringStatusHeader';
 import { MonitoringSummarySection } from '@/features/monitoring/components/MonitoringSummarySection';
 import { RealtimeEventsPanel } from '@/features/monitoring/components/RealtimeEventsPanel';
-import type { SummaryCardProps } from '@/features/monitoring/components/MonitoringShared';
 import {
-  formatPercent,
   type AccountQuotaEntry,
   type AccountQuotaState,
 } from '@/features/monitoring/components/accountOverviewPresentation';
 import {
-  buildAccountOptionLabel,
+  buildAccountOptions,
+  buildAccountOverviewColumns,
+  buildAccountSortOptions,
+  buildApiKeyOptions,
+  buildApiKeyOverviewColumns,
+  buildAuthFilesByAuthIndex,
+  buildChannelOptions,
+  buildModelOptions,
   buildPaginationState,
+  buildPriceModelOptions,
+  buildPrimarySummaryCards,
+  buildProviderOptions,
   buildRealtimeLogRows,
+  buildSecondarySummaryCards,
+  buildStatusOptions,
+  buildSyncPriceModels,
   createPriceDraft,
-  ensureSelectedOption,
   formatAccountOverviewScopeText,
   getCurrentInputValue,
   getTodayStartInputValue,
@@ -72,7 +82,6 @@ import {
   parseDateTimeLocalValue,
   parsePriceValue,
   requestAccountQuota,
-  type AccountOverviewColumn,
   type FocusSnapshot,
   type PriceDraft,
   type StatusFilter,
@@ -83,15 +92,8 @@ import { useInterval } from '@/hooks/useInterval';
 import { useRequestMonitoringAvailability } from '@/hooks/useRequestMonitoringAvailability';
 import { authFilesApi } from '@/services/api';
 import { useAuthStore, useConfigStore, useNotificationStore } from '@/stores';
-import type { AuthFileItem } from '@/types';
 import { formatFileSize } from '@/utils/format';
 import type { StatusBarData } from '@/utils/recentRequests';
-import {
-  formatCompactNumber,
-  formatDurationMs,
-  formatUsd,
-  normalizeAuthIndex,
-} from '@/utils/usage';
 import { downloadBlob } from '@/utils/download';
 import { sha256Hex } from '@/utils/apiKeyHash';
 import styles from './MonitoringCenterPage.module.scss';
@@ -335,123 +337,45 @@ export function MonitoringCenterPage() {
   }, [accountOverviewMode, accountPageByMode.card, accountPageSizeByMode.card, accountSort]);
 
   const providerOptions = useMemo(
-    () =>
-      ensureSelectedOption(
-        [
-          { value: 'all', label: t('monitoring.filter_all_providers') },
-          ...Array.from(new Set(filteredRows.map((row) => row.provider)))
-            .filter(Boolean)
-            .sort((left, right) => left.localeCompare(right))
-            .map((value) => ({ value, label: value })),
-        ],
-        selectedProvider
-      ),
+    () => buildProviderOptions(filteredRows, selectedProvider, t),
     [filteredRows, selectedProvider, t]
   );
 
   const accountOptionRows = useMemo(() => buildAccountRows(filteredRows), [filteredRows]);
 
   const accountOptions = useMemo(
-    () =>
-      ensureSelectedOption(
-        [
-          { value: 'all', label: t('monitoring.filter_all_accounts') },
-          ...Array.from(
-            new Map(
-              accountOptionRows.map((row) => [row.account, buildAccountOptionLabel(row)])
-            ).entries()
-          )
-            .sort((left, right) => left[1].localeCompare(right[1]))
-            .map(([value, label]) => ({ value, label })),
-        ],
-        selectedAccount
-      ),
+    () => buildAccountOptions(accountOptionRows, selectedAccount, t),
     [accountOptionRows, selectedAccount, t]
   );
 
   const modelOptions = useMemo(
-    () =>
-      ensureSelectedOption(
-        [
-          { value: 'all', label: t('monitoring.filter_all_models') },
-          ...Array.from(new Set(filteredRows.map((row) => row.model)))
-            .filter(Boolean)
-            .sort((left, right) => left.localeCompare(right))
-            .map((value) => ({ value, label: value })),
-        ],
-        selectedModel
-      ),
+    () => buildModelOptions(filteredRows, selectedModel, t),
     [filteredRows, selectedModel, t]
   );
 
   const channelOptions = useMemo(
-    () =>
-      ensureSelectedOption(
-        [
-          { value: 'all', label: t('monitoring.filter_all_channels') },
-          ...Array.from(new Set(filteredRows.map((row) => row.channel)))
-            .filter(Boolean)
-            .sort((left, right) => left.localeCompare(right))
-            .map((value) => ({ value, label: value })),
-        ],
-        selectedChannel
-      ),
+    () => buildChannelOptions(filteredRows, selectedChannel, t),
     [filteredRows, selectedChannel, t]
   );
 
-  const apiKeyOptions = useMemo(() => {
-    const optionMap = new Map<string, string>();
-    filteredRows.forEach((row) => {
-      if (!row.apiKeyHash || optionMap.has(row.apiKeyHash)) return;
-      optionMap.set(row.apiKeyHash, row.apiKeyLabel || row.apiKeyMasked || row.apiKeyHash);
-    });
-
-    return ensureSelectedOption(
-      [
-        { value: 'all', label: t('monitoring.filter_all_api_keys') },
-        ...Array.from(optionMap.entries())
-          .sort((left, right) => left[1].localeCompare(right[1]))
-          .map(([value, label]) => ({ value, label })),
-      ],
-      selectedApiKeyHash,
-      selectedApiKeyHash
-    );
-  }, [filteredRows, selectedApiKeyHash, t]);
-
-  const statusOptions = useMemo(
-    () => [
-      { value: 'all', label: t('monitoring.filter_all_statuses') },
-      { value: 'success', label: t('monitoring.filter_status_success') },
-      { value: 'failed', label: t('monitoring.filter_status_failed') },
-    ],
-    [t]
+  const apiKeyOptions = useMemo(
+    () => buildApiKeyOptions(filteredRows, selectedApiKeyHash, t),
+    [filteredRows, selectedApiKeyHash, t]
   );
 
+  const statusOptions = useMemo(() => buildStatusOptions(t), [t]);
+
   const syncPriceModels = useMemo(
-    () =>
-      Array.from(new Set([...filteredRows.map((row) => row.model), ...Object.keys(modelPrices)]))
-        .filter(Boolean)
-        .sort((left, right) => left.localeCompare(right)),
+    () => buildSyncPriceModels(filteredRows, modelPrices),
     [filteredRows, modelPrices]
   );
 
   const priceModelOptions = useMemo(
-    () => [
-      { value: '', label: t('usage_stats.model_price_select_placeholder') },
-      ...syncPriceModels.map((value) => ({ value, label: value })),
-    ],
+    () => buildPriceModelOptions(syncPriceModels, t),
     [syncPriceModels, t]
   );
 
-  const authFilesByAuthIndex = useMemo(() => {
-    const map = new Map<string, AuthFileItem>();
-    authFiles.forEach((file) => {
-      const authIndex = normalizeAuthIndex(file['auth_index'] ?? file.authIndex);
-      if (!authIndex || map.has(authIndex)) return;
-      map.set(authIndex, file);
-    });
-    return map;
-  }, [authFiles]);
+  const authFilesByAuthIndex = useMemo(() => buildAuthFilesByAuthIndex(authFiles), [authFiles]);
 
   const scopedRows = filteredRows;
   const scopedStatsRows = useMemo(
@@ -588,127 +512,37 @@ export function MonitoringCenterPage() {
           ? t('common.error')
           : t('common.disconnected_status');
 
-  const accountOverviewColumns = useMemo<AccountOverviewColumn[]>(
-    () => [
-      { key: 'account', label: t('monitoring.account_overview_col_account') },
-      { key: 'status', label: t('monitoring.column_status') },
-      { key: 'total-calls', label: t('monitoring.total_calls'), sortKey: 'totalCalls' },
-      {
-        key: 'success-calls',
-        label: t('monitoring.account_overview_col_success'),
-        sortKey: 'successCalls',
-      },
-      {
-        key: 'failure-calls',
-        label: t('monitoring.account_overview_col_failure'),
-        sortKey: 'failureCalls',
-      },
-      { key: 'success-rate', label: t('monitoring.column_success_rate'), sortKey: 'successRate' },
-      { key: 'total-tokens', label: t('monitoring.total_tokens'), sortKey: 'totalTokens' },
-      {
-        key: 'estimated-cost',
-        label: t('monitoring.account_overview_col_cost'),
-        sortKey: 'totalCost',
-      },
-      {
-        key: 'latest-request-time',
-        label: t('monitoring.latest_request_time'),
-        sortKey: 'lastSeenAt',
-      },
-      { key: 'action', label: t('common.action') },
-    ],
-    [t]
-  );
+  const accountOverviewColumns = useMemo(() => buildAccountOverviewColumns(t), [t]);
 
-  const apiKeyOverviewColumns = useMemo<AccountOverviewColumn[]>(
-    () => [
-      { key: 'api-key', label: t('monitoring.api_key_summary_col_key') },
-      { key: 'total-calls', label: t('monitoring.total_calls') },
-      { key: 'success-calls', label: t('monitoring.account_overview_col_success') },
-      { key: 'failure-calls', label: t('monitoring.account_overview_col_failure') },
-      { key: 'total-tokens', label: t('monitoring.total_tokens') },
-      { key: 'estimated-cost', label: t('monitoring.account_overview_col_cost') },
-      { key: 'latest-request-time', label: t('monitoring.latest_request_time') },
-    ],
-    [t]
-  );
+  const apiKeyOverviewColumns = useMemo(() => buildApiKeyOverviewColumns(t), [t]);
 
-  const accountSortOptions = useMemo(() => {
-    const prefix = t('monitoring.account_overview_sort_prefix');
-    return accountOverviewColumns
-      .filter((column): column is AccountOverviewColumn & { sortKey: AccountSortKey } =>
-        Boolean(column.sortKey)
-      )
-      .map((column) => ({
-        value: column.sortKey,
-        label: `${prefix}${column.label}`,
-      }));
-  }, [accountOverviewColumns, t]);
+  const accountSortOptions = useMemo(
+    () => buildAccountSortOptions(accountOverviewColumns, t),
+    [accountOverviewColumns, t]
+  );
 
   const accountPageSizeOptions =
     accountOverviewMode === 'card'
       ? ACCOUNT_OVERVIEW_CARD_PAGE_SIZE_OPTIONS
       : ACCOUNT_OVERVIEW_TABLE_PAGE_SIZE_OPTIONS;
 
-  const primarySummaryCards: SummaryCardProps[] = [
-    {
-      label: t('monitoring.total_calls'),
-      value: formatCompactNumber(scopedSummary.totalCalls),
-      meta: `${accountRows.length} ${t('monitoring.accounts_suffix')}`,
-    },
-    {
-      label: t('monitoring.call_success_rate'),
-      value: formatPercent(scopedSummary.successRate),
-      meta: formatDurationMs(scopedSummary.averageLatencyMs, { locale: i18n.language }),
-      tone:
-        scopedSummary.successRate >= 0.95
-          ? 'good'
-          : scopedSummary.successRate >= 0.85
-            ? 'warn'
-            : 'bad',
-    },
-    {
-      label: t('monitoring.failure_calls'),
-      value: formatCompactNumber(scopedSummary.failureCalls),
-      meta: `${failedGroupCount} ${t('monitoring.groups_suffix')}`,
-      tone: scopedSummary.failureCalls > 0 ? 'bad' : 'good',
-    },
-    {
-      label: t('monitoring.estimated_cost'),
-      value: hasPrices ? formatUsd(scopedSummary.totalCost) : '--',
-      meta: hasPrices
-        ? t('monitoring.estimated_cost_hint')
-        : t('monitoring.estimated_cost_missing'),
-      tone: hasPrices ? undefined : 'warn',
-    },
-  ];
+  const primarySummaryCards = useMemo(
+    () =>
+      buildPrimarySummaryCards({
+        summary: scopedSummary,
+        accountCount: accountRows.length,
+        failedGroupCount,
+        hasPrices,
+        locale: i18n.language,
+        t,
+      }),
+    [accountRows.length, failedGroupCount, hasPrices, i18n.language, scopedSummary, t]
+  );
 
-  const secondarySummaryCards: SummaryCardProps[] = [
-    {
-      label: t('monitoring.total_tokens'),
-      value: formatCompactNumber(scopedSummary.totalTokens),
-      meta: `${t('monitoring.reasoning_tokens')} ${formatCompactNumber(scopedSummary.reasoningTokens)}`,
-      variant: 'secondary',
-    },
-    {
-      label: t('monitoring.input_tokens'),
-      value: formatCompactNumber(scopedSummary.inputTokens),
-      meta: `${t('monitoring.of_token_mix')} ${formatPercent(scopedSummary.totalTokens > 0 ? scopedSummary.inputTokens / scopedSummary.totalTokens : 0)}`,
-      variant: 'secondary',
-    },
-    {
-      label: t('monitoring.output_tokens'),
-      value: formatCompactNumber(scopedSummary.outputTokens),
-      meta: `${t('monitoring.of_token_mix')} ${formatPercent(scopedSummary.totalTokens > 0 ? scopedSummary.outputTokens / scopedSummary.totalTokens : 0)}`,
-      variant: 'secondary',
-    },
-    {
-      label: t('monitoring.cached_tokens'),
-      value: formatCompactNumber(scopedSummary.cachedTokens),
-      meta: `${t('monitoring.of_input_tokens')} ${formatPercent(scopedSummary.inputTokens > 0 ? scopedSummary.cachedTokens / scopedSummary.inputTokens : 0)}`,
-      variant: 'secondary',
-    },
-  ];
+  const secondarySummaryCards = useMemo(
+    () => buildSecondarySummaryCards(scopedSummary, t),
+    [scopedSummary, t]
+  );
 
   const restoreFocusSnapshot = useCallback(() => {
     const snapshot = focusSnapshotRef.current;
