@@ -21,6 +21,7 @@ type CodexInspectionStatusPanelProps = {
   inspectionSettings: CodexInspectionConfigurableSettings;
   statusTone: StatusTone;
   statusLabel: string;
+  executionModeLabel: string;
   autoActionModeLabel: string;
   lastFinishedLabel: string | null;
   pendingActionCount: number;
@@ -44,6 +45,7 @@ export function CodexInspectionStatusPanel({
   inspectionSettings,
   statusTone,
   statusLabel,
+  executionModeLabel,
   autoActionModeLabel,
   lastFinishedLabel,
   pendingActionCount,
@@ -72,6 +74,7 @@ export function CodexInspectionStatusPanel({
               {statusLabel}
             </span>
             <div className={styles.statusMeta}>
+              <span>{`${t('monitoring.codex_inspection_execution_mode')}: ${executionModeLabel}`}</span>
               <span>{`${t('monitoring.codex_inspection_target_type')}: ${inspectionSettings.targetType}`}</span>
               <span>{`${t('monitoring.codex_inspection_threshold')}: ${inspectionSettings.usedPercentThreshold}%`}</span>
               <span>{`${t('monitoring.codex_inspection_workers')}: ${inspectionSettings.workers}`}</span>

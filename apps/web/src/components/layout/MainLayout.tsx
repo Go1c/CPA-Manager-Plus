@@ -374,12 +374,6 @@ export function MainLayout() {
         path: '/codex-inspection',
         label: t('nav.codex_inspection'),
         icon: sidebarIcons.codexInspection,
-        exact: true,
-      },
-      {
-        path: '/codex-inspection/server',
-        label: t('nav.server_codex_inspection'),
-        icon: sidebarIcons.codexInspection,
       },
     ],
     operationNavItems,

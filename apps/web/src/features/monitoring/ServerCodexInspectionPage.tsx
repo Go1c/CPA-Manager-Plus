@@ -5,6 +5,7 @@ import { IconCheck, IconCrosshair, IconShield, IconTrash2 } from '@/components/u
 import { Input } from '@/components/ui/Input';
 import { Select, type SelectOption } from '@/components/ui/Select';
 import { ToggleSwitch } from '@/components/ui/ToggleSwitch';
+import { CodexInspectionModeTabs } from '@/features/monitoring/components/CodexInspectionModeTabs';
 import { Panel } from '@/features/monitoring/components/CodexInspectionPanels';
 import {
   formatActionLabel,
@@ -716,6 +717,7 @@ export function ServerCodexInspectionPage() {
       : '--';
     const durationLabel = formatDuration(activeRun, t);
     const serviceHost = formatServiceHost(serviceBase);
+    const executionModeLabel = t('monitoring.codex_inspection_mode_server');
     return (
       <Panel
         title={t('monitoring.server_codex_inspection_title')}
@@ -749,6 +751,9 @@ export function ServerCodexInspectionPage() {
                 : t('monitoring.server_codex_inspection_schedule_disabled')}
             </span>
             <div className={styles.statusMeta}>
+              <span>
+                {t('monitoring.codex_inspection_execution_mode')}: {executionModeLabel}
+              </span>
               <span>{savedScheduleLabel}</span>
               <span>
                 {t('monitoring.server_codex_inspection_last_run')}: {lastRunTime}
@@ -1389,6 +1394,8 @@ export function ServerCodexInspectionPage() {
 
   return (
     <div className={styles.page}>
+      <CodexInspectionModeTabs activeMode="server" />
+
       {error ? (
         <div className={styles.topErrorBar} role="alert" aria-live="polite">
           <span>{error}</span>

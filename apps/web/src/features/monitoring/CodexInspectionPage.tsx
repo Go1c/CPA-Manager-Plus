@@ -25,6 +25,7 @@ import {
   type CodexInspectionSession,
 } from '@/features/monitoring/codexInspection';
 import { CodexInspectionLogsPanel } from '@/features/monitoring/components/CodexInspectionLogsPanel';
+import { CodexInspectionModeTabs } from '@/features/monitoring/components/CodexInspectionModeTabs';
 import { CodexInspectionResultsPanel } from '@/features/monitoring/components/CodexInspectionResultsPanel';
 import { CodexInspectionSettingsModal } from '@/features/monitoring/components/CodexInspectionSettingsModal';
 import { CodexInspectionStatusPanel } from '@/features/monitoring/components/CodexInspectionStatusPanel';
@@ -799,15 +800,19 @@ export function CodexInspectionPage() {
       ? t('monitoring.codex_inspection_resume')
       : runStatus === 'running'
         ? t('monitoring.codex_inspection_running')
-        : t('monitoring.codex_inspection_run');
+        : t('monitoring.codex_inspection_run_local');
   const autoActionModeLabel = formatAutoActionModeLabel(inspectionSettings.autoActionMode, t);
+  const executionModeLabel = t('monitoring.codex_inspection_mode_local');
 
   return (
     <div className={styles.page}>
+      <CodexInspectionModeTabs activeMode="local" />
+
       <CodexInspectionStatusPanel
         inspectionSettings={inspectionSettings}
         statusTone={statusTone}
         statusLabel={statusLabel}
+        executionModeLabel={executionModeLabel}
         autoActionModeLabel={autoActionModeLabel}
         lastFinishedLabel={lastFinishedLabel}
         pendingActionCount={pendingActionCount}
