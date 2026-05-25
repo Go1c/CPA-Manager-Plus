@@ -1354,6 +1354,7 @@
     "request_monitoring_unavailable_title": "Request monitoring service unavailable",
     "request_monitoring_disabled_body": "CPA Manager Plus is not currently running the request collector. Enable request monitoring in CPA Manager Plus Configuration when you need this page.",
     "request_monitoring_service_unavailable_body": "The configured Manager Server cannot be reached. Check the service URL, network, and deployment status.",
+    "request_monitoring_manager_mismatch_body": "The configured Manager Server is bound to another CPA. Rebind it to the current CPA in CPA Manager Plus Configuration to avoid mixing monitoring data.",
     "request_monitoring_not_configured_body": "No available Manager Server was detected. The CPA-hosted panel mode requires a deployed and configured Manager Server.",
     "empty_diagnostics_body": "If CPA has produced requests but this view is still empty, confirm usage publishing is enabled, check Manager Server /status, and make sure only one Manager Server consumes the same CPA usage queue.",
     "empty_diagnostics_link": "Why is this empty?",

@@ -1354,6 +1354,7 @@
     "request_monitoring_unavailable_title": "请求监控服务不可用",
     "request_monitoring_disabled_body": "CPA Manager Plus 当前没有启动请求采集器。需要使用监控页时，请到 CPA Manager Plus 配置中启用请求监控。",
     "request_monitoring_service_unavailable_body": "已配置的 Manager Server 暂时无法访问。请检查服务地址、网络和部署状态。",
+    "request_monitoring_manager_mismatch_body": "已配置的 Manager Server 绑定到另一个 CPA。请到 CPA Manager Plus 配置中重新绑定到当前 CPA，避免混用监控数据。",
     "request_monitoring_not_configured_body": "当前没有检测到可用的 Manager Server。CPA 控制面板方案需要先部署并配置 Manager Server。",
     "empty_diagnostics_body": "如果 CPA 已产生请求但这里仍为空，请确认已启用用量发布，检查 Manager Server /status，并确保同一个 CPA 实例只有一个 Manager Server 消费用量队列。",
     "empty_diagnostics_link": "为什么没有数据？",

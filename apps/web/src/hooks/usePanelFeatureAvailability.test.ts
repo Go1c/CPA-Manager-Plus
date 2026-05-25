@@ -3,6 +3,7 @@ import type { ManagerConfig } from '@/services/api/usageService';
 import {
   buildPanelManagerServiceCandidates,
   managerConfigMatchesPanel,
+  managerConfigTargetsDifferentCPA,
   resolvePanelFeatureAvailability,
 } from './usePanelFeatureAvailability';
 
@@ -63,6 +64,36 @@ describe('panel feature availability', () => {
         apiBase: 'http://cpa.local:8317',
         config: buildManagerConfig({
           externalUsageService: { enabled: false, serviceBase: '' },
+        }),
+      })
+    ).toBe(false);
+  });
+
+  it('only marks an external Manager Server as mismatched when it is bound to another CPA', () => {
+    expect(
+      managerConfigTargetsDifferentCPA({
+        panelHostedByUsageService: false,
+        apiBase: 'http://other-cpa.local:8317',
+        config: buildManagerConfig(),
+      })
+    ).toBe(true);
+
+    expect(
+      managerConfigTargetsDifferentCPA({
+        panelHostedByUsageService: false,
+        apiBase: 'http://cpa.local:8317',
+        config: buildManagerConfig({
+          externalUsageService: { enabled: false, serviceBase: '' },
+        }),
+      })
+    ).toBe(false);
+
+    expect(
+      managerConfigTargetsDifferentCPA({
+        panelHostedByUsageService: false,
+        apiBase: 'http://cpa.local:8317',
+        config: buildManagerConfig({
+          cpaConnection: { cpaBaseUrl: '', managementKey: '' },
         }),
       })
     ).toBe(false);

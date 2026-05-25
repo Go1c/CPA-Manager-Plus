@@ -1379,6 +1379,7 @@
     "request_monitoring_unavailable_title": "請求監控服務不可用",
     "request_monitoring_disabled_body": "CPA Manager Plus 目前沒有啟動請求採集器。需要使用監控頁時，請到 CPA Manager Plus 設定中啟用請求監控。",
     "request_monitoring_service_unavailable_body": "已設定的 Manager Server 暫時無法存取。請檢查服務位址、網路和部署狀態。",
+    "request_monitoring_manager_mismatch_body": "已設定的 Manager Server 綁定到另一個 CPA。請到 CPA Manager Plus 設定中重新綁定到目前 CPA，避免混用監控資料。",
     "request_monitoring_not_configured_body": "目前沒有偵測到可用的 Manager Server。CPA 控制面板方案需要先部署並設定 Manager Server。",
     "empty_diagnostics_body": "如果 CPA 已產生請求但這裡仍為空，請確認已啟用用量發布，檢查 Manager Server /status，並確保同一個 CPA 執行個體只有一個 Manager Server 消費用量佇列。",
     "empty_diagnostics_link": "為什麼沒有資料？",

@@ -1350,6 +1350,7 @@
     "request_monitoring_unavailable_title": "Сервис мониторинга запросов недоступен",
     "request_monitoring_disabled_body": "Сборщик запросов CPA Manager Plus сейчас не запущен. Включите мониторинг запросов в конфигурации CPA Manager Plus, если нужна эта страница.",
     "request_monitoring_service_unavailable_body": "Настроенный Manager Server сейчас недоступен. Проверьте URL сервиса, сеть и состояние развёртывания.",
+    "request_monitoring_manager_mismatch_body": "Настроенный Manager Server привязан к другому CPA. Перепривяжите его к текущему CPA в конфигурации CPA Manager Plus, чтобы не смешивать данные мониторинга.",
     "request_monitoring_not_configured_body": "Доступный Manager Server не обнаружен. Для панели, размещённой CPA, сначала нужно развернуть и настроить Manager Server.",
     "empty_diagnostics_body": "Если CPA уже обрабатывал запросы, а этот экран всё ещё пуст, включите публикацию usage, проверьте Manager Server /status и убедитесь, что одну очередь CPA usage потребляет только один Manager Server.",
     "empty_diagnostics_link": "Почему здесь пусто?",

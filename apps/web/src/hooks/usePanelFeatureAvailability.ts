@@ -14,6 +14,7 @@ export type PanelFeatureUnavailableReason =
   | 'checking'
   | 'service_not_configured'
   | 'service_unavailable'
+  | 'manager_mismatch'
   | 'monitoring_disabled';
 
 export interface PanelFeatureAvailability {
@@ -166,6 +167,28 @@ export function managerConfigMatchesPanel({
   return Boolean(configuredCPA && currentCPA && configuredCPA === currentCPA);
 }
 
+export function managerConfigTargetsDifferentCPA({
+  panelHostedByUsageService,
+  apiBase,
+  config,
+}: {
+  panelHostedByUsageService: boolean;
+  apiBase: string;
+  config: ManagerConfig;
+}): boolean {
+  if (panelHostedByUsageService) {
+    return false;
+  }
+  const configuredCPA = normalizeBase(config.cpaConnection?.cpaBaseUrl);
+  const currentCPA = normalizeBase(apiBase);
+  return Boolean(
+    configuredCPA &&
+      currentCPA &&
+      config.cpaConnection?.managementKey &&
+      configuredCPA !== currentCPA
+  );
+}
+
 const initialAvailability: PanelFeatureAvailability = {
   checking: true,
   panelHostMode: 'external_panel',
@@ -235,6 +258,7 @@ export function usePanelFeatureAvailability(): PanelFeatureAvailability {
         storedPanelBase,
         storedPanelHostMode,
       });
+      let hasManagerMismatch = false;
 
       for (const candidate of candidates) {
         try {
@@ -248,6 +272,15 @@ export function usePanelFeatureAvailability(): PanelFeatureAvailability {
               config: response.config,
             })
           ) {
+            if (
+              managerConfigTargetsDifferentCPA({
+                panelHostedByUsageService,
+                apiBase,
+                config: response.config,
+              })
+            ) {
+              hasManagerMismatch = true;
+            }
             continue;
           }
           if (cancelled) return;
@@ -269,17 +302,23 @@ export function usePanelFeatureAvailability(): PanelFeatureAvailability {
       }
 
       if (cancelled) return;
-      setState(
-        resolvePanelFeatureAvailability({
-          checking: false,
-          panelHostedByUsageService,
-          panelBase: normalizedPanelBase,
-          managerServiceBase: '',
-          managerConfig: null,
-          hasManagerCandidate: candidates.length > 0,
-          managementKey,
-        })
-      );
+      const unavailableState = resolvePanelFeatureAvailability({
+        checking: false,
+        panelHostedByUsageService,
+        panelBase: normalizedPanelBase,
+        managerServiceBase: '',
+        managerConfig: null,
+        hasManagerCandidate: candidates.length > 0,
+        managementKey,
+      });
+      if (hasManagerMismatch) {
+        setState({
+          ...unavailableState,
+          reason: 'manager_mismatch',
+        });
+        return;
+      }
+      setState(unavailableState);
     };
 
     void detect();

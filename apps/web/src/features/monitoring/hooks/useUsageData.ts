@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { resolveUsageServiceBase } from '@/entities/usageService/baseResolver';
+import { usePanelFeatureAvailability } from '@/hooks/usePanelFeatureAvailability';
 import {
   usageServiceApi,
   type ApiKeyAlias,
@@ -9,7 +9,7 @@ import {
   type UsageExportResponse,
   type UsageImportResponse,
 } from '@/services/api/usageService';
-import { useAuthStore, useUsageServiceStore } from '@/stores';
+import { useAuthStore } from '@/stores';
 import { clearModelPrices, loadModelPrices, saveModelPrices, type ModelPrice } from '@/utils/usage';
 
 export interface UsagePayload {
@@ -44,10 +44,8 @@ export interface UseUsageDataOptions {
 export function useUsageData({
   loadUsageEvents = true,
 }: UseUsageDataOptions = {}): UseUsageDataReturn {
-  const apiBase = useAuthStore((state) => state.apiBase);
   const managementKey = useAuthStore((state) => state.managementKey);
-  const usageServiceEnabled = useUsageServiceStore((state) => state.enabled);
-  const usageServiceBase = useUsageServiceStore((state) => state.serviceBase);
+  const featureAvailability = usePanelFeatureAvailability();
   const [usage, setUsage] = useState<UsagePayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -57,72 +55,63 @@ export function useUsageData({
   const [usageServiceAvailable, setUsageServiceAvailable] = useState(false);
   const requestIdRef = useRef(0);
   const aliasRequestIdRef = useRef(0);
-
-  const resolveServiceBase = useCallback(
-    () =>
-      resolveUsageServiceBase({
-        apiBase,
-        usageServiceEnabled,
-        usageServiceBase,
-      }),
-    [apiBase, usageServiceBase, usageServiceEnabled]
-  );
+  const managerServiceAvailable = featureAvailability.managerServiceAvailable;
+  const modelPriceServiceBase = featureAvailability.modelPricesAvailable
+    ? featureAvailability.managerServiceBase
+    : '';
+  const usageEventsServiceBase = featureAvailability.requestMonitoringAvailable
+    ? featureAvailability.managerServiceBase
+    : '';
 
   const getModelPricesFromApi = useCallback(async (): Promise<ModelPricesResponse> => {
-    const serviceBase = await resolveServiceBase();
-    if (!serviceBase) {
+    if (!modelPriceServiceBase) {
       return { prices: {} };
     }
-    return usageServiceApi.getModelPrices(serviceBase, managementKey);
-  }, [managementKey, resolveServiceBase]);
+    return usageServiceApi.getModelPrices(modelPriceServiceBase, managementKey);
+  }, [managementKey, modelPriceServiceBase]);
 
   const getApiKeyAliasesFromApi = useCallback(async (): Promise<ApiKeyAliasesResponse> => {
-    const serviceBase = await resolveServiceBase();
-    if (!serviceBase) {
+    if (!modelPriceServiceBase) {
       return { items: [] };
     }
-    return usageServiceApi.getApiKeyAliases(serviceBase, managementKey);
-  }, [managementKey, resolveServiceBase]);
+    return usageServiceApi.getApiKeyAliases(modelPriceServiceBase, managementKey);
+  }, [managementKey, modelPriceServiceBase]);
 
   const saveModelPricesToApi = useCallback(
     async (prices: Record<string, ModelPrice>): Promise<ModelPricesResponse> => {
-      const serviceBase = await resolveServiceBase();
-      if (!serviceBase) {
+      if (!modelPriceServiceBase) {
         throw new Error('model_price_api_unavailable');
       }
-      return usageServiceApi.saveModelPrices(serviceBase, prices, managementKey);
+      return usageServiceApi.saveModelPrices(modelPriceServiceBase, prices, managementKey);
     },
-    [managementKey, resolveServiceBase]
+    [managementKey, modelPriceServiceBase]
   );
 
   const syncModelPricesFromApi = useCallback(
     async (models?: string[]): Promise<ModelPriceSyncResponse> => {
-      const serviceBase = await resolveServiceBase();
-      if (!serviceBase) {
+      if (!modelPriceServiceBase) {
         throw new Error('model_price_sync_requires_usage_service');
       }
-      return usageServiceApi.syncModelPrices(serviceBase, managementKey, models);
+      return usageServiceApi.syncModelPrices(modelPriceServiceBase, managementKey, models);
     },
-    [managementKey, resolveServiceBase]
+    [managementKey, modelPriceServiceBase]
   );
 
   const exportUsageFromApi = useCallback(async (): Promise<UsageExportResponse> => {
-    const serviceBase = await resolveServiceBase();
-    if (!serviceBase) {
+    if (!usageEventsServiceBase) {
       throw new Error('usage_import_export_requires_usage_service');
     }
-    return usageServiceApi.exportUsage(serviceBase, managementKey);
-  }, [managementKey, resolveServiceBase]);
+    return usageServiceApi.exportUsage(usageEventsServiceBase, managementKey);
+  }, [managementKey, usageEventsServiceBase]);
 
   const importUsageToApi = useCallback(
     async (file: File): Promise<UsageImportResponse> => {
-      const serviceBase = await resolveServiceBase();
-      if (!serviceBase) {
+      if (!usageEventsServiceBase) {
         throw new Error('usage_import_export_requires_usage_service');
       }
-      return usageServiceApi.importUsage(serviceBase, file, managementKey);
+      return usageServiceApi.importUsage(usageEventsServiceBase, file, managementKey);
     },
-    [managementKey, resolveServiceBase]
+    [managementKey, usageEventsServiceBase]
   );
 
   const loadModelPricesFromStorage = useCallback(async () => {
@@ -176,15 +165,14 @@ export function useUsageData({
     setError('');
 
     try {
-      const serviceBase = await resolveServiceBase();
-      if (!serviceBase) {
+      if (!usageEventsServiceBase) {
         setUsageServiceAvailable(false);
         setUsage(null);
         setLastRefreshedAt(null);
         return;
       }
       setUsageServiceAvailable(true);
-      const payload = await usageServiceApi.getUsage(serviceBase, managementKey);
+      const payload = await usageServiceApi.getUsage(usageEventsServiceBase, managementKey);
       if (requestIdRef.current !== requestId) return;
       setUsage(payload ?? null);
       setLastRefreshedAt(new Date());
@@ -196,7 +184,7 @@ export function useUsageData({
         setLoading(false);
       }
     }
-  }, [loadUsageEvents, managementKey, resolveServiceBase]);
+  }, [loadUsageEvents, managementKey, usageEventsServiceBase]);
 
   useEffect(() => {
     void loadModelPricesFromStorage();
@@ -235,7 +223,7 @@ export function useUsageData({
     lastRefreshedAt,
     modelPrices,
     apiKeyAliases,
-    usageServiceAvailable,
+    usageServiceAvailable: managerServiceAvailable || usageServiceAvailable,
     setModelPrices,
     loadApiKeyAliases,
     syncModelPrices,

@@ -4,6 +4,7 @@ export type RequestMonitoringUnavailableReason =
   | 'checking'
   | 'service_not_configured'
   | 'service_unavailable'
+  | 'manager_mismatch'
   | 'monitoring_disabled';
 
 export interface RequestMonitoringAvailability {
