@@ -27,6 +27,7 @@ export const buildWildcardSearch = (value: string): RegExp | null => {
 };
 
 const PREMIUM_CODEX_PLAN_TYPES = new Set(['pro', 'prolite', 'pro-lite', 'pro_lite']);
+const CODEX_FIVE_HOUR_WINDOW_SECONDS = 18_000;
 const CODEX_WEEKLY_WINDOW_SECONDS = 604_800;
 const UNKNOWN_AUTH_INDEX_KEY = '-';
 
@@ -35,6 +36,7 @@ export const AUTH_FILES_CODEX_STATUS_FILTERS = [
   // Legacy URL/query value. The Auth Files UI now presents 401 as "needs reauth".
   'http_401',
   'reauth',
+  'five_hour_limited',
   'weekly_limited',
   'disabled_with_reset',
 ] as const;
@@ -43,6 +45,7 @@ export type AuthFilesCodexStatusFilter = (typeof AUTH_FILES_CODEX_STATUS_FILTERS
 export type AuthFileCodexStatusBadgeTone = 'danger' | 'warning' | 'info';
 export type AuthFileCodexStatusBadgeKind =
   | 'reauth'
+  | 'five_hour_limited'
   | 'weekly_limited'
   | 'disabled_with_reset';
 
@@ -60,9 +63,13 @@ export type AuthFileCodexStatusSummary = {
   isCodex: boolean;
   isHttp401: boolean;
   needsReauth: boolean;
+  isFiveHourLimited: boolean;
   isWeeklyLimited: boolean;
-  hasDisabledWeeklyReset: boolean;
+  hasDisabledRecoveryReset: boolean;
+  fiveHourResetLabel: string | null;
   weeklyResetLabel: string | null;
+  recoveryResetLabel: string | null;
+  fiveHourUsedPercent: number | null;
   weeklyUsedPercent: number | null;
   badges: AuthFileCodexStatusBadge[];
 };
@@ -107,20 +114,43 @@ const isKnownResetLabel = (value: unknown): value is string => {
   return trimmed.length > 0 && trimmed !== '-';
 };
 
+const normalizeWindowSeconds = (value: unknown): number | null => normalizeNumber(value);
+
+const findCodexQuotaWindow = (
+  quota: CodexQuotaState | undefined,
+  preferredMatch: (window: CodexQuotaState['windows'][number]) => boolean,
+  limitWindowSeconds: number
+) => {
+  const windows = quota?.windows ?? [];
+  return (
+    windows.find(preferredMatch) ??
+    windows.find((window) => normalizeWindowSeconds(window.limitWindowSeconds) === limitWindowSeconds) ??
+    null
+  );
+};
+
+const findCodexFiveHourQuotaWindow = (quota?: CodexQuotaState) =>
+  findCodexQuotaWindow(
+    quota,
+    (window) => window.id === 'five-hour' || window.labelKey === 'codex_quota.primary_window',
+    CODEX_FIVE_HOUR_WINDOW_SECONDS
+  );
+
 const findCodexWeeklyQuotaWindow = (quota?: CodexQuotaState) =>
-  quota?.windows.find((window) => {
-    if (window.limitWindowSeconds === CODEX_WEEKLY_WINDOW_SECONDS) return true;
-    if (window.id === 'weekly' || window.id.endsWith('-weekly')) return true;
-    if (window.labelKey?.includes('secondary_window')) return true;
-    return false;
-  }) ?? null;
+  findCodexQuotaWindow(
+    quota,
+    (window) => window.id === 'weekly' || window.labelKey === 'codex_quota.secondary_window',
+    CODEX_WEEKLY_WINDOW_SECONDS
+  );
 
 export const normalizeAuthFilesCodexStatusFilter = (
   value: unknown
-): AuthFilesCodexStatusFilter | null =>
-  CODEX_STATUS_FILTER_SET.has(value as AuthFilesCodexStatusFilter)
+): AuthFilesCodexStatusFilter | null => {
+  if (value === 'http_401') return 'reauth';
+  return CODEX_STATUS_FILTER_SET.has(value as AuthFilesCodexStatusFilter)
     ? (value as AuthFilesCodexStatusFilter)
     : null;
+};
 
 export const getAuthFileCodexInspectionKey = (fileName: string, authIndex?: unknown) =>
   `${fileName}::${normalizeAuthIndexKey(authIndex)}`;
@@ -150,19 +180,28 @@ export const getAuthFileCodexStatus = (
       isCodex: false,
       isHttp401: false,
       needsReauth: false,
+      isFiveHourLimited: false,
       isWeeklyLimited: false,
-      hasDisabledWeeklyReset: false,
+      hasDisabledRecoveryReset: false,
+      fiveHourResetLabel: null,
       weeklyResetLabel: null,
+      recoveryResetLabel: null,
+      fiveHourUsedPercent: null,
       weeklyUsedPercent: null,
       badges: [],
     };
   }
 
+  const fiveHourWindow = findCodexFiveHourQuotaWindow(quota);
   const weeklyWindow = findCodexWeeklyQuotaWindow(quota);
+  const fiveHourUsedPercent = normalizeNumber(fiveHourWindow?.usedPercent);
   const weeklyWindowUsedPercent = normalizeNumber(weeklyWindow?.usedPercent);
   const inspectionUsedPercent =
     inspection?.isQuota === true ? normalizeNumber(inspection?.usedPercent) : null;
   const weeklyUsedPercent = weeklyWindowUsedPercent ?? inspectionUsedPercent;
+  const fiveHourResetLabel = isKnownResetLabel(fiveHourWindow?.resetLabel)
+    ? fiveHourWindow.resetLabel.trim()
+    : null;
   const weeklyResetLabel = isKnownResetLabel(weeklyWindow?.resetLabel)
     ? weeklyWindow.resetLabel.trim()
     : null;
@@ -182,7 +221,14 @@ export const getAuthFileCodexStatus = (
       (file.disabled === true && action === 'keep'));
   const isWeeklyLimited =
     (weeklyUsedPercent !== null && weeklyUsedPercent >= 100) || inspectionReachedQuota;
-  const hasDisabledWeeklyReset = file.disabled === true && weeklyResetLabel !== null;
+  const isFiveHourLimited = fiveHourUsedPercent !== null && fiveHourUsedPercent >= 100;
+  const recoveryResetLabel =
+    isWeeklyLimited && weeklyResetLabel
+      ? weeklyResetLabel
+      : isFiveHourLimited && fiveHourResetLabel
+        ? fiveHourResetLabel
+        : null;
+  const hasDisabledRecoveryReset = file.disabled === true && recoveryResetLabel !== null;
   const badges: AuthFileCodexStatusBadge[] = [];
 
   if (needsReauth) {
@@ -193,6 +239,17 @@ export const getAuthFileCodexStatus = (
       defaultLabel: 'Needs reauth',
       titleKey: 'auth_files.codex_status_badge_reauth_title',
       defaultTitle: 'Latest Codex check returned 401 or suggested reauthorization.',
+    });
+  }
+
+  if (isFiveHourLimited) {
+    badges.push({
+      kind: 'five_hour_limited',
+      tone: 'warning',
+      labelKey: 'auth_files.codex_status_badge_five_hour_limited',
+      defaultLabel: '5h quota full',
+      titleKey: 'auth_files.codex_status_badge_five_hour_limited_title',
+      defaultTitle: 'The Codex 5-hour quota window is at or above the limit.',
     });
   }
 
@@ -207,15 +264,15 @@ export const getAuthFileCodexStatus = (
     });
   }
 
-  if (hasDisabledWeeklyReset && weeklyResetLabel) {
+  if (hasDisabledRecoveryReset && recoveryResetLabel) {
     badges.push({
       kind: 'disabled_with_reset',
       tone: 'info',
       labelKey: 'auth_files.codex_status_badge_disabled_reset',
-      defaultLabel: `Restores ${weeklyResetLabel}`,
+      defaultLabel: `Restores ${recoveryResetLabel}`,
       titleKey: 'auth_files.codex_status_badge_disabled_reset_title',
-      defaultTitle: `This disabled Codex account has a known quota recovery time: ${weeklyResetLabel}`,
-      labelParams: { reset: weeklyResetLabel },
+      defaultTitle: `This disabled Codex account has a known quota recovery time: ${recoveryResetLabel}`,
+      labelParams: { reset: recoveryResetLabel },
     });
   }
 
@@ -223,9 +280,13 @@ export const getAuthFileCodexStatus = (
     isCodex,
     isHttp401,
     needsReauth,
+    isFiveHourLimited,
     isWeeklyLimited,
-    hasDisabledWeeklyReset,
+    hasDisabledRecoveryReset,
+    fiveHourResetLabel,
     weeklyResetLabel,
+    recoveryResetLabel,
+    fiveHourUsedPercent,
     weeklyUsedPercent,
     badges,
   };
@@ -239,8 +300,9 @@ export const authFileMatchesCodexStatusFilter = (
   if (!status.isCodex) return false;
   if (filter === 'http_401') return status.isHttp401;
   if (filter === 'reauth') return status.needsReauth || status.isHttp401;
+  if (filter === 'five_hour_limited') return status.isFiveHourLimited;
   if (filter === 'weekly_limited') return status.isWeeklyLimited;
-  if (filter === 'disabled_with_reset') return status.hasDisabledWeeklyReset;
+  if (filter === 'disabled_with_reset') return status.hasDisabledRecoveryReset;
   return true;
 };
 

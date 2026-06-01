@@ -472,6 +472,10 @@ export function AuthFilesPage() {
     () => [
       { value: 'all', label: t('auth_files.codex_status_filter_all') },
       { value: 'reauth', label: t('auth_files.codex_status_filter_reauth') },
+      {
+        value: 'five_hour_limited',
+        label: t('auth_files.codex_status_filter_five_hour_limited'),
+      },
       { value: 'weekly_limited', label: t('auth_files.codex_status_filter_weekly_limited') },
       {
         value: 'disabled_with_reset',

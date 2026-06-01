@@ -25,6 +25,13 @@ const codexQuota = (overrides: Partial<CodexQuotaState> = {}): CodexQuotaState =
   status: 'success',
   windows: [
     {
+      id: 'five-hour',
+      label: '5-hour limit',
+      usedPercent: 10,
+      resetLabel: '06/01 17:00',
+      limitWindowSeconds: 18_000,
+    },
+    {
       id: 'weekly',
       label: 'Weekly limit',
       usedPercent: 100,
@@ -45,15 +52,104 @@ describe('auth file Codex status helpers', () => {
     expect(status.badges.map((badge) => badge.kind)).toContain('weekly_limited');
   });
 
-  it('detects disabled Codex files with a known weekly reset label', () => {
+  it('detects five-hour limited Codex quota from the short quota window', () => {
+    const status = getAuthFileCodexStatus(
+      codexFile(),
+      codexQuota({
+        windows: [
+          {
+            id: 'five-hour',
+            label: '5-hour limit',
+            usedPercent: 100,
+            resetLabel: '06/01 17:00',
+            limitWindowSeconds: 18_000,
+          },
+          {
+            id: 'weekly',
+            label: 'Weekly limit',
+            usedPercent: 45,
+            resetLabel: '06/04 12:00',
+            limitWindowSeconds: 604_800,
+          },
+        ],
+      })
+    );
+
+    expect(status.isFiveHourLimited).toBe(true);
+    expect(status.isWeeklyLimited).toBe(false);
+    expect(status.fiveHourResetLabel).toBe('06/01 17:00');
+    expect(authFileMatchesCodexStatusFilter(status, 'five_hour_limited')).toBe(true);
+    expect(authFileMatchesCodexStatusFilter(status, 'weekly_limited')).toBe(false);
+    expect(status.badges.map((badge) => badge.kind)).toContain('five_hour_limited');
+  });
+
+  it('detects disabled Codex files with a known quota recovery label', () => {
     const status = getAuthFileCodexStatus(codexFile({ disabled: true }), codexQuota());
 
-    expect(status.hasDisabledWeeklyReset).toBe(true);
+    expect(status.hasDisabledRecoveryReset).toBe(true);
     expect(status.weeklyResetLabel).toBe('06/04 12:00');
+    expect(status.recoveryResetLabel).toBe('06/04 12:00');
     expect(authFileMatchesCodexStatusFilter(status, 'disabled_with_reset')).toBe(true);
     expect(status.badges.find((badge) => badge.kind === 'disabled_with_reset')).toMatchObject({
       labelParams: { reset: '06/04 12:00' },
     });
+  });
+
+  it('uses the five-hour reset label for disabled files when only the short window is full', () => {
+    const status = getAuthFileCodexStatus(
+      codexFile({ disabled: true }),
+      codexQuota({
+        windows: [
+          {
+            id: 'five-hour',
+            label: '5-hour limit',
+            usedPercent: 100,
+            resetLabel: '06/01 17:00',
+            limitWindowSeconds: 18_000,
+          },
+          {
+            id: 'weekly',
+            label: 'Weekly limit',
+            usedPercent: 45,
+            resetLabel: '06/04 12:00',
+            limitWindowSeconds: 604_800,
+          },
+        ],
+      })
+    );
+
+    expect(status.hasDisabledRecoveryReset).toBe(true);
+    expect(status.recoveryResetLabel).toBe('06/01 17:00');
+    expect(status.badges.find((badge) => badge.kind === 'disabled_with_reset')).toMatchObject({
+      labelParams: { reset: '06/01 17:00' },
+    });
+  });
+
+  it('does not mark manually disabled Codex files as waiting recovery when quota is available', () => {
+    const status = getAuthFileCodexStatus(
+      codexFile({ disabled: true }),
+      codexQuota({
+        windows: [
+          {
+            id: 'five-hour',
+            label: '5-hour limit',
+            usedPercent: 10,
+            resetLabel: '06/01 17:00',
+            limitWindowSeconds: 18_000,
+          },
+          {
+            id: 'weekly',
+            label: 'Weekly limit',
+            usedPercent: 45,
+            resetLabel: '06/04 12:00',
+            limitWindowSeconds: 604_800,
+          },
+        ],
+      })
+    );
+
+    expect(status.hasDisabledRecoveryReset).toBe(false);
+    expect(authFileMatchesCodexStatusFilter(status, 'disabled_with_reset')).toBe(false);
   });
 
   it('detects HTTP 401 and reauth needs from the latest inspection result', () => {
@@ -126,6 +222,8 @@ describe('auth file Codex status helpers', () => {
     expect(
       stringifySearchValue(getAuthFileSearchValues(codexFile(), t, undefined, status))
     ).toContain('auth_files.codex_status_badge_reauth');
+    expect(normalizeAuthFilesCodexStatusFilter('http_401')).toBe('reauth');
+    expect(normalizeAuthFilesCodexStatusFilter('five_hour_limited')).toBe('five_hour_limited');
     expect(normalizeAuthFilesCodexStatusFilter('disabled_with_reset')).toBe('disabled_with_reset');
     expect(normalizeAuthFilesCodexStatusFilter('unknown')).toBeNull();
   });
