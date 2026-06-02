@@ -1418,6 +1418,10 @@
     "cache_creation_tokens_short": "Create",
     "reasoning_effort": "Reasoning Effort",
     "reasoning_effort_short": "Effort",
+    "service_tier": "Service Tier",
+    "service_tier_short": "Tier",
+    "executor_type": "Executor Type",
+    "executor_type_short": "Executor",
     "fail_status_code": "Failure Status Code",
     "fail_status_code_short": "HTTP",
     "fail_body": "Failure Body",
@@ -2116,7 +2120,9 @@
           "timeout": "Timeout",
           "stabilize_device": "Stabilize Device Profile",
           "stabilize_device_desc": "Pin OS/Arch and stabilize the software fingerprint per credential/API key",
-          "beta_features": "Beta Features"
+          "beta_features": "Beta Features",
+          "identity_confuse": "Enable Codex Identity Confuse",
+          "identity_confuse_desc": "Write codex.identity-confuse to let CPA mix Codex request identity headers for compatibility"
         },
         "network": {
           "title": "Network Configuration",

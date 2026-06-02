@@ -1418,6 +1418,10 @@
     "cache_creation_tokens_short": "创建",
     "reasoning_effort": "思考强度",
     "reasoning_effort_short": "强度",
+    "service_tier": "服务等级",
+    "service_tier_short": "等级",
+    "executor_type": "执行器类型",
+    "executor_type_short": "执行器",
     "fail_status_code": "失败状态码",
     "fail_status_code_short": "HTTP",
     "fail_body": "失败内容",
@@ -2116,7 +2120,9 @@
           "timeout": "Timeout",
           "stabilize_device": "稳定设备指纹",
           "stabilize_device_desc": "固定 OS/Arch，并按凭据/API Key 稳定软件指纹",
-          "beta_features": "Beta Features"
+          "beta_features": "Beta Features",
+          "identity_confuse": "启用 Codex 身份混淆",
+          "identity_confuse_desc": "写入 codex.identity-confuse，让 CPA 混合 Codex 请求身份 Header 以提升兼容性"
         },
         "network": {
           "title": "网络配置",

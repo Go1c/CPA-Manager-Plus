@@ -1414,6 +1414,10 @@
     "cache_creation_tokens_short": "Создание",
     "reasoning_effort": "Уровень рассуждения",
     "reasoning_effort_short": "Уровень",
+    "service_tier": "Уровень сервиса",
+    "service_tier_short": "Сервис",
+    "executor_type": "Тип исполнителя",
+    "executor_type_short": "Исполнитель",
     "fail_status_code": "Код ошибки",
     "fail_status_code_short": "HTTP",
     "fail_body": "Тело ошибки",
@@ -2112,7 +2116,9 @@
           "timeout": "Timeout",
           "stabilize_device": "Стабилизировать профиль устройства",
           "stabilize_device_desc": "Фиксировать OS/Arch и стабилизировать программный отпечаток для учётных данных/API-ключа",
-          "beta_features": "Beta Features"
+          "beta_features": "Beta Features",
+          "identity_confuse": "Включить Codex identity-confuse",
+          "identity_confuse_desc": "Записывает codex.identity-confuse, чтобы CPA смешивал identity-заголовки Codex для совместимости"
         },
         "network": {
           "title": "Сетевые настройки",
