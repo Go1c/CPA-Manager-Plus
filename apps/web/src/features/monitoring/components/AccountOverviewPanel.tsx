@@ -43,6 +43,7 @@ import styles from '../MonitoringCenterPage.module.scss';
 type AccountOverviewColumn = {
   key: string;
   label: string;
+  fullLabel?: string;
   sortKey?: AccountSortKey;
 };
 
@@ -133,10 +134,11 @@ function AccountColumnLabel({
   t: TFunction;
 }) {
   const info = getAccountColumnInfo(column.key, t);
+  const labelTitle = column.fullLabel ?? column.label;
 
   return (
     <span className={styles.tableHeaderWithInfo}>
-      <span>{column.label}</span>
+      <span title={labelTitle}>{column.label}</span>
       {info ? (
         <span title={info}>
           <IconInfo size={13} className={styles.tableHeaderInfoIcon} aria-label={info} />
