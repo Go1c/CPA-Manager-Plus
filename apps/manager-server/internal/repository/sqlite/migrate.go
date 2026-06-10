@@ -150,6 +150,25 @@ func Migrate(db *sql.DB) error {
 			foreign key(run_id) references codex_inspection_runs(id) on delete cascade
 		)`,
 		`create index if not exists idx_codex_inspection_logs_run on codex_inspection_logs(run_id, created_at_ms)`,
+		`create table if not exists quota_cooldowns (
+			id integer primary key autoincrement,
+			auth_file_name text not null,
+			auth_index text,
+			account_snapshot text,
+			provider text,
+			recover_at_ms integer not null,
+			owner text not null,
+			event_hash text,
+			pre_disabled_state integer not null default 0,
+			status text not null,
+			disabled_at_ms integer not null,
+			recovered_at_ms integer,
+			last_error text,
+			created_at_ms integer not null,
+			updated_at_ms integer not null
+		)`,
+		`create index if not exists idx_quota_cooldowns_due on quota_cooldowns(status, recover_at_ms)`,
+		`create unique index if not exists idx_quota_cooldowns_active_owner on quota_cooldowns(auth_file_name, owner) where status = 'active'`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {

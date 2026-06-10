@@ -9,13 +9,13 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	collectorpkg "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/collector"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/cpa"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/store"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
@@ -25,20 +25,22 @@ const (
 	quotaAutoDisableQueueSize     = 256
 	quotaAutoDisableDefaultTick   = 15 * time.Second
 	quotaAutoDisableActionTimeout = 15 * time.Second
+	quotaCooldownDueLimit         = 100
 )
 
 // RateLimitAutoDisableWorker reacts to request-monitoring events in near real time.
-// When CPA reports a quota-exhausted response with a reset time, the worker disables
-// the corresponding auth file immediately and re-enables that same file when the
-// reported reset time arrives.
+// It only handles Codex 429 usage_limit_reached responses that include an explicit
+// reset time. Disables are persisted with CPAMP ownership, so recovery never relies
+// solely on in-memory timers and never re-enables pre-existing/manual disables.
 type RateLimitAutoDisableWorker struct {
 	store  *store.Store
 	client *http.Client
 
 	jobs chan quotaAutoDisableCandidate
 
-	mu                  sync.Mutex
-	scheduledEnables    map[string]scheduledQuotaEnable
+	mu                  sync.RWMutex
+	baseURL             string
+	managementKey       string
 	enableCheckInterval time.Duration
 }
 
@@ -46,6 +48,7 @@ type quotaAutoDisableCandidate struct {
 	BaseURL        string
 	ManagementKey  string
 	FileName       string
+	AuthIndex      string
 	DisplayAccount string
 	Provider       string
 	ResetAt        time.Time
@@ -53,27 +56,19 @@ type quotaAutoDisableCandidate struct {
 	Reason         string
 }
 
-type scheduledQuotaEnable struct {
-	BaseURL           string
-	ManagementKey     string
-	FileName          string
-	DisplayAccount    string
-	Provider          string
-	DisabledAt        time.Time
-	ResetAt           time.Time
-	NextEnableAttempt time.Time
-	LastEventHash     string
-	Reason            string
-}
+type authFile map[string]any
 
-func NewRateLimitAutoDisableWorker(st *store.Store) *RateLimitAutoDisableWorker {
-	return &RateLimitAutoDisableWorker{
+func NewRateLimitAutoDisableWorker(st *store.Store, initial ...collectorpkg.RuntimeConfig) *RateLimitAutoDisableWorker {
+	w := &RateLimitAutoDisableWorker{
 		store:               st,
 		client:              &http.Client{Timeout: quotaAutoDisableActionTimeout},
 		jobs:                make(chan quotaAutoDisableCandidate, quotaAutoDisableQueueSize),
-		scheduledEnables:    make(map[string]scheduledQuotaEnable),
 		enableCheckInterval: quotaAutoDisableDefaultTick,
 	}
+	if len(initial) > 0 {
+		w.setRuntimeConfig(initial[0].CPAUpstreamURL, initial[0].ManagementKey)
+	}
+	return w
 }
 
 func (w *RateLimitAutoDisableWorker) Start(ctx context.Context) {
@@ -92,6 +87,7 @@ func (w *RateLimitAutoDisableWorker) HandleUsageEvents(ctx context.Context, cfg 
 	if baseURL == "" || managementKey == "" {
 		return
 	}
+	w.setRuntimeConfig(baseURL, managementKey)
 	now := time.Now()
 	for _, event := range events {
 		candidate, ok := quotaAutoDisableCandidateFromEvent(event, baseURL, managementKey, now)
@@ -116,6 +112,7 @@ func (w *RateLimitAutoDisableWorker) run(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	w.enableDue(ctx, time.Now())
 	for {
 		select {
 		case <-ctx.Done():
@@ -128,7 +125,24 @@ func (w *RateLimitAutoDisableWorker) run(ctx context.Context) {
 	}
 }
 
+func (w *RateLimitAutoDisableWorker) setRuntimeConfig(baseURL string, managementKey string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.baseURL = strings.TrimSpace(baseURL)
+	w.managementKey = strings.TrimSpace(managementKey)
+}
+
+func (w *RateLimitAutoDisableWorker) runtimeConfig() (string, string) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.baseURL, w.managementKey
+}
+
 func (w *RateLimitAutoDisableWorker) handleCandidate(ctx context.Context, candidate quotaAutoDisableCandidate) {
+	if w == nil || w.store == nil || w.store.QuotaCooldowns == nil {
+		log.Printf("[quota-auto-disable] store unavailable, skip auth file %q", candidate.FileName)
+		return
+	}
 	if candidate.FileName == "" || candidate.BaseURL == "" || candidate.ManagementKey == "" {
 		return
 	}
@@ -138,275 +152,276 @@ func (w *RateLimitAutoDisableWorker) handleCandidate(ctx context.Context, candid
 		return
 	}
 
-	w.mu.Lock()
-	existing, alreadyScheduled := w.scheduledEnables[candidate.FileName]
-	if alreadyScheduled {
-		if candidate.ResetAt.After(existing.ResetAt) {
-			existing.ResetAt = candidate.ResetAt
-			existing.NextEnableAttempt = candidate.ResetAt
-			existing.LastEventHash = candidate.EventHash
-			existing.Reason = candidate.Reason
-			w.scheduledEnables[candidate.FileName] = existing
-			log.Printf("[quota-auto-disable] extended auth file %q auto-enable time to %s", candidate.FileName, candidate.ResetAt.Format(time.RFC3339))
-		}
-		w.mu.Unlock()
+	current, ok, err := w.currentAuthFile(ctx, candidate.BaseURL, candidate.ManagementKey, candidate.FileName, candidate.AuthIndex)
+	if err != nil {
+		log.Printf("[quota-auto-disable] failed to verify auth file %q before disable: %v", candidate.FileName, err)
 		return
 	}
-	w.mu.Unlock()
+	if !ok {
+		log.Printf("[quota-auto-disable] auth file %q authIndex=%q not found/currently mismatched, skip auto disable", candidate.FileName, candidate.AuthIndex)
+		return
+	}
+	preDisabled := authFileDisabled(current)
+	if preDisabled {
+		if w.extendExistingCooldown(ctx, candidate, current) {
+			return
+		}
+		log.Printf("[quota-auto-disable] auth file %q was already disabled without CPAMP ownership; skip auto disable/recovery", candidate.FileName)
+		return
+	}
 
-	log.Printf("[quota-auto-disable] quota exhausted for auth file %q account=%q provider=%q resetAt=%s, disabling", candidate.FileName, candidate.DisplayAccount, candidate.Provider, candidate.ResetAt.Format(time.RFC3339))
+	log.Printf("[quota-auto-disable] Codex usage limit reached for auth file %q account=%q provider=%q resetAt=%s, disabling", candidate.FileName, candidate.DisplayAccount, candidate.Provider, candidate.ResetAt.Format(time.RFC3339))
 	if err := w.patchAuthFile(ctx, candidate.BaseURL, candidate.ManagementKey, candidate.FileName, true); err != nil {
 		log.Printf("[quota-auto-disable] failed to disable auth file %q: %v", candidate.FileName, err)
 		return
 	}
 
-	w.mu.Lock()
-	if existing, ok := w.scheduledEnables[candidate.FileName]; ok && existing.ResetAt.After(candidate.ResetAt) {
-		w.mu.Unlock()
+	_, err = w.store.UpsertQuotaCooldown(ctx, store.QuotaCooldownUpsert{
+		AuthFileName:     candidate.FileName,
+		AuthIndex:        firstNonEmpty(candidate.AuthIndex, authFileAuthIndex(current)),
+		AccountSnapshot:  candidate.DisplayAccount,
+		Provider:         strings.ToLower(strings.TrimSpace(candidate.Provider)),
+		RecoverAtMS:      candidate.ResetAt.UnixMilli(),
+		Owner:            model.QuotaCooldownOwnerUsage429,
+		EventHash:        candidate.EventHash,
+		PreDisabledState: preDisabled,
+		DisabledAtMS:     now.UnixMilli(),
+	})
+	if err != nil {
+		log.Printf("[quota-auto-disable] disabled auth file %q but failed to persist cooldown ownership: %v", candidate.FileName, err)
+		if rollbackErr := w.patchAuthFile(ctx, candidate.BaseURL, candidate.ManagementKey, candidate.FileName, false); rollbackErr != nil {
+			log.Printf("[quota-auto-disable] failed to roll back auth file %q after cooldown persistence error: %v", candidate.FileName, rollbackErr)
+		}
 		return
 	}
-	w.scheduledEnables[candidate.FileName] = scheduledQuotaEnable{
-		BaseURL:           candidate.BaseURL,
-		ManagementKey:     candidate.ManagementKey,
-		FileName:          candidate.FileName,
-		DisplayAccount:    candidate.DisplayAccount,
-		Provider:          candidate.Provider,
-		DisabledAt:        now,
-		ResetAt:           candidate.ResetAt,
-		NextEnableAttempt: candidate.ResetAt,
-		LastEventHash:     candidate.EventHash,
-		Reason:            candidate.Reason,
+	log.Printf("[quota-auto-disable] disabled auth file %q; persisted CPAMP-owned auto-enable at %s", candidate.FileName, candidate.ResetAt.Format(time.RFC3339))
+}
+
+func (w *RateLimitAutoDisableWorker) extendExistingCooldown(ctx context.Context, candidate quotaAutoDisableCandidate, current authFile) bool {
+	active, err := w.store.QuotaCooldowns.ListActive(ctx)
+	if err != nil {
+		log.Printf("[quota-auto-disable] failed to check active cooldowns for auth file %q: %v", candidate.FileName, err)
+		return false
 	}
-	w.mu.Unlock()
-	log.Printf("[quota-auto-disable] disabled auth file %q; scheduled auto-enable at %s", candidate.FileName, candidate.ResetAt.Format(time.RFC3339))
+	var existing store.QuotaCooldown
+	for _, item := range active {
+		if item.AuthFileName == candidate.FileName && item.Owner == model.QuotaCooldownOwnerUsage429 {
+			existing = item
+			break
+		}
+	}
+	if existing.ID == 0 {
+		return false
+	}
+	currentIndex := authFileAuthIndex(current)
+	if existing.AuthIndex != "" && currentIndex != existing.AuthIndex {
+		log.Printf("[quota-auto-disable] active cooldown auth index mismatch for auth file %q: stored=%q current=%q", candidate.FileName, existing.AuthIndex, currentIndex)
+		return false
+	}
+	_, err = w.store.UpsertQuotaCooldown(ctx, store.QuotaCooldownUpsert{
+		AuthFileName:     candidate.FileName,
+		AuthIndex:        firstNonEmpty(candidate.AuthIndex, existing.AuthIndex, authFileAuthIndex(current)),
+		AccountSnapshot:  firstNonEmpty(candidate.DisplayAccount, existing.AccountSnapshot),
+		Provider:         strings.ToLower(strings.TrimSpace(firstNonEmpty(candidate.Provider, existing.Provider))),
+		RecoverAtMS:      candidate.ResetAt.UnixMilli(),
+		Owner:            model.QuotaCooldownOwnerUsage429,
+		EventHash:        candidate.EventHash,
+		PreDisabledState: false,
+		DisabledAtMS:     existing.DisabledAtMS,
+	})
+	if err != nil {
+		log.Printf("[quota-auto-disable] failed to extend active cooldown for auth file %q: %v", candidate.FileName, err)
+		return false
+	}
+	log.Printf("[quota-auto-disable] extended CPAMP-owned auth file %q auto-enable time to %s", candidate.FileName, candidate.ResetAt.Format(time.RFC3339))
+	return true
 }
 
 func (w *RateLimitAutoDisableWorker) enableDue(ctx context.Context, now time.Time) {
-	w.mu.Lock()
-	due := make([]scheduledQuotaEnable, 0)
-	for _, item := range w.scheduledEnables {
-		if !item.NextEnableAttempt.After(now) {
-			due = append(due, item)
-		}
+	if w == nil || w.store == nil || w.store.QuotaCooldowns == nil {
+		return
 	}
-	w.mu.Unlock()
-
+	baseURL, managementKey := w.runtimeConfig()
+	if baseURL == "" || managementKey == "" {
+		return
+	}
+	due, err := w.store.ListDueQuotaCooldowns(ctx, now.UnixMilli(), quotaCooldownDueLimit)
+	if err != nil {
+		log.Printf("[quota-auto-disable] failed to list due quota cooldowns: %v", err)
+		return
+	}
 	for _, item := range due {
-		w.mu.Lock()
-		current, ok := w.scheduledEnables[item.FileName]
-		if !ok || !current.ResetAt.Equal(item.ResetAt) || current.NextEnableAttempt.After(now) {
-			w.mu.Unlock()
-			continue
-		}
-		w.mu.Unlock()
-
-		log.Printf("[quota-auto-disable] reset time reached for auth file %q account=%q, enabling", item.FileName, item.DisplayAccount)
-		if err := w.patchAuthFile(ctx, item.BaseURL, item.ManagementKey, item.FileName, false); err != nil {
-			log.Printf("[quota-auto-disable] failed to enable auth file %q: %v", item.FileName, err)
-			w.mu.Lock()
-			current, ok := w.scheduledEnables[item.FileName]
-			if ok && current.ResetAt.Equal(item.ResetAt) {
-				current.NextEnableAttempt = time.Now().Add(30 * time.Second)
-				w.scheduledEnables[item.FileName] = current
-			}
-			w.mu.Unlock()
-			continue
-		}
-		w.mu.Lock()
-		current, ok = w.scheduledEnables[item.FileName]
-		if ok && current.ResetAt.Equal(item.ResetAt) {
-			delete(w.scheduledEnables, item.FileName)
-		}
-		w.mu.Unlock()
-		log.Printf("[quota-auto-disable] enabled auth file %q after quota reset", item.FileName)
+		w.recoverCooldown(ctx, baseURL, managementKey, item, now)
 	}
 }
 
+func (w *RateLimitAutoDisableWorker) recoverCooldown(ctx context.Context, baseURL string, managementKey string, item store.QuotaCooldown, now time.Time) {
+	if item.Owner != model.QuotaCooldownOwnerUsage429 {
+		_ = w.store.MarkQuotaCooldownSkipped(ctx, item.ID, "unknown owner")
+		return
+	}
+	if item.PreDisabledState {
+		_ = w.store.MarkQuotaCooldownSkipped(ctx, item.ID, "pre-disabled before CPAMP action")
+		return
+	}
+	current, ok, err := w.currentAuthFile(ctx, baseURL, managementKey, item.AuthFileName, item.AuthIndex)
+	if err != nil {
+		_ = w.store.RecordQuotaCooldownFailure(ctx, item.ID, err.Error())
+		log.Printf("[quota-auto-disable] failed to verify auth file %q before recovery: %v", item.AuthFileName, err)
+		return
+	}
+	if !ok {
+		_ = w.store.MarkQuotaCooldownSkipped(ctx, item.ID, "auth file missing or auth index mismatch")
+		log.Printf("[quota-auto-disable] auth file %q authIndex=%q missing/mismatched, skip auto-enable", item.AuthFileName, item.AuthIndex)
+		return
+	}
+	if !authFileDisabled(current) {
+		_ = w.store.MarkQuotaCooldownRecovered(ctx, item.ID, now.UnixMilli())
+		log.Printf("[quota-auto-disable] auth file %q already enabled; marked cooldown recovered", item.AuthFileName)
+		return
+	}
+
+	log.Printf("[quota-auto-disable] reset time reached for auth file %q account=%q, enabling", item.AuthFileName, item.AccountSnapshot)
+	if err := w.patchAuthFile(ctx, baseURL, managementKey, item.AuthFileName, false); err != nil {
+		_ = w.store.RecordQuotaCooldownFailure(ctx, item.ID, err.Error())
+		log.Printf("[quota-auto-disable] failed to enable auth file %q: %v", item.AuthFileName, err)
+		return
+	}
+	if err := w.store.MarkQuotaCooldownRecovered(ctx, item.ID, now.UnixMilli()); err != nil {
+		log.Printf("[quota-auto-disable] enabled auth file %q but failed to mark cooldown recovered: %v", item.AuthFileName, err)
+		return
+	}
+	log.Printf("[quota-auto-disable] enabled auth file %q after Codex usage-limit reset", item.AuthFileName)
+}
+
 func quotaAutoDisableCandidateFromEvent(event usage.Event, baseURL string, managementKey string, now time.Time) (quotaAutoDisableCandidate, bool) {
-	if !isQuotaExhaustedEvent(event) {
+	resetAt, ok := codexUsageLimitResetTimeFromEvent(event, now)
+	if !ok {
 		return quotaAutoDisableCandidate{}, false
 	}
 	fileName := strings.TrimSpace(event.AuthFileSnapshot)
 	if fileName == "" {
-		log.Printf("[quota-auto-disable] quota event %q has no auth file snapshot, skip auto disable", event.EventHash)
-		return quotaAutoDisableCandidate{}, false
-	}
-	resetAt, ok := quotaResetTimeFromEvent(event, now)
-	if !ok {
-		log.Printf("[quota-auto-disable] quota event for auth file %q has no parseable reset time, skip auto disable", fileName)
+		log.Printf("[quota-auto-disable] Codex usage-limit event %q has no auth file snapshot, skip auto disable", event.EventHash)
 		return quotaAutoDisableCandidate{}, false
 	}
 	return quotaAutoDisableCandidate{
 		BaseURL:        baseURL,
 		ManagementKey:  managementKey,
 		FileName:       fileName,
+		AuthIndex:      strings.TrimSpace(event.AuthIndex),
 		DisplayAccount: firstNonEmpty(event.AccountSnapshot, event.AuthLabelSnapshot, event.Source, fileName),
-		Provider:       event.Provider,
+		Provider:       "codex",
 		ResetAt:        resetAt,
 		EventHash:      event.EventHash,
 		Reason:         event.FailSummary,
 	}, true
 }
 
-func isQuotaExhaustedEvent(event usage.Event) bool {
-	if !event.Failed {
-		return false
-	}
-	statusCode := event.FailStatusCode
-	body := strings.ToLower(strings.Join([]string{event.FailSummary, event.FailBody, event.RawJSON}, "\n"))
-	if strings.Contains(body, "quota_exhausted") ||
-		strings.Contains(body, "quota exhausted") ||
-		strings.Contains(body, "quota exceeded") ||
-		strings.Contains(body, "limit reached") ||
-		strings.Contains(body, "payment_required") ||
-		strings.Contains(body, "rate_limit_exceeded") ||
-		strings.Contains(body, "rate limit exceeded") ||
-		strings.Contains(body, "rate limit reached") ||
-		strings.Contains(body, "usage limit") {
-		return true
-	}
-	return statusCode == http.StatusPaymentRequired && strings.Contains(body, "quota")
-}
-
-func quotaResetTimeFromEvent(event usage.Event, now time.Time) (time.Time, bool) {
-	candidates := []string{event.FailBody, event.FailSummary, event.RawJSON}
-	for _, candidate := range candidates {
-		if resetAt, ok := resetTimeFromText(candidate, now); ok {
-			return resetAt, true
-		}
-	}
-	return time.Time{}, false
-}
-
-func resetTimeFromText(text string, now time.Time) (time.Time, bool) {
-	text = strings.TrimSpace(text)
-	if text == "" {
+func codexUsageLimitResetTimeFromEvent(event usage.Event, now time.Time) (time.Time, bool) {
+	if !event.Failed || event.FailStatusCode != http.StatusTooManyRequests {
 		return time.Time{}, false
 	}
-	var decoded any
-	if err := json.Unmarshal([]byte(text), &decoded); err == nil {
-		if resetAt, ok := resetTimeFromJSON(decoded, now, ""); ok {
+	provider := strings.ToLower(strings.TrimSpace(firstNonEmpty(event.Provider, event.AuthProviderSnapshot)))
+	if provider != "codex" {
+		return time.Time{}, false
+	}
+	for _, text := range []string{event.FailBody, event.RawJSON, event.FailSummary} {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		var decoded any
+		decoder := json.NewDecoder(strings.NewReader(text))
+		decoder.UseNumber()
+		if err := decoder.Decode(&decoded); err != nil {
+			continue
+		}
+		if resetAt, ok := usageLimitResetFromJSON(decoded, now); ok {
 			return resetAt, true
 		}
-	}
-	if resetAt, ok := resetTimeFromPlainText(text, now); ok {
-		return resetAt, true
 	}
 	return time.Time{}, false
 }
 
-func resetTimeFromJSON(value any, now time.Time, keyHint string) (time.Time, bool) {
+func usageLimitResetFromJSON(value any, now time.Time) (time.Time, bool) {
 	switch typed := value.(type) {
 	case map[string]any:
-		preferred := []string{
-			"reset_at", "resetAt", "reset_time", "resetTime", "resets_at", "resetsAt",
-			"rate_limit_reset_at", "rateLimitResetAt", "retry-after", "Retry-After", "retry_after", "retryAfter",
-			"x-ratelimit-reset", "X-RateLimit-Reset", "x_rate_limit_reset", "xRateLimitReset",
-		}
-		for _, key := range preferred {
-			if raw, ok := typed[key]; ok {
-				if resetAt, ok := parseResetValue(raw, now, key); ok {
-					return resetAt, true
-				}
-			}
-		}
-		for key, child := range typed {
-			if resetAt, ok := resetTimeFromJSON(child, now, key); ok {
+		if isUsageLimitMap(typed) {
+			if resetAt, ok := explicitCodexResetTime(typed, now); ok {
 				return resetAt, true
 			}
 		}
-	case []any:
-		if isResetKey(keyHint) || isRetryAfterKey(keyHint) {
-			for _, item := range typed {
-				if resetAt, ok := parseResetValue(item, now, keyHint); ok {
+		if rawError, ok := typed["error"]; ok {
+			if errorMap, ok := rawError.(map[string]any); ok && isUsageLimitMap(errorMap) {
+				if resetAt, ok := explicitCodexResetTime(errorMap, now); ok {
+					return resetAt, true
+				}
+				if resetAt, ok := explicitCodexResetTime(typed, now); ok {
 					return resetAt, true
 				}
 			}
 		}
 		for _, child := range typed {
-			if resetAt, ok := resetTimeFromJSON(child, now, keyHint); ok {
+			if resetAt, ok := usageLimitResetFromJSON(child, now); ok {
 				return resetAt, true
 			}
 		}
-	default:
-		if isResetKey(keyHint) || isRetryAfterKey(keyHint) {
-			return parseResetValue(typed, now, keyHint)
+	case []any:
+		for _, child := range typed {
+			if resetAt, ok := usageLimitResetFromJSON(child, now); ok {
+				return resetAt, true
+			}
 		}
 	}
 	return time.Time{}, false
 }
 
-func parseResetValue(value any, now time.Time, keyHint string) (time.Time, bool) {
+func isUsageLimitMap(value map[string]any) bool {
+	return strings.EqualFold(strings.TrimSpace(fmt.Sprint(value["type"])), "usage_limit_reached")
+}
+
+func explicitCodexResetTime(value map[string]any, now time.Time) (time.Time, bool) {
+	for _, key := range []string{"resets_at", "resetsAt"} {
+		if raw, ok := value[key]; ok {
+			return parseResetValue(raw, now, false)
+		}
+	}
+	for _, key := range []string{"resets_in_seconds", "resetsInSeconds"} {
+		if raw, ok := value[key]; ok {
+			return parseResetValue(raw, now, true)
+		}
+	}
+	return time.Time{}, false
+}
+
+func parseResetValue(value any, now time.Time, relative bool) (time.Time, bool) {
 	if value == nil {
 		return time.Time{}, false
 	}
-	if isRetryAfterKey(keyHint) {
-		return parseRetryAfterValue(value, now)
-	}
 	switch typed := value.(type) {
 	case json.Number:
-		return parseResetNumberString(typed.String(), now, false)
+		return parseResetNumberString(typed.String(), now, relative)
 	case float64:
-		return resetTimeFromNumber(typed, now, false)
+		return resetTimeFromNumber(typed, now, relative)
 	case int:
-		return resetTimeFromNumber(float64(typed), now, false)
+		return resetTimeFromNumber(float64(typed), now, relative)
 	case int64:
-		return resetTimeFromNumber(float64(typed), now, false)
+		return resetTimeFromNumber(float64(typed), now, relative)
 	case string:
-		return parseResetNumberString(strings.TrimSpace(typed), now, false)
+		return parseResetNumberString(strings.TrimSpace(typed), now, relative)
 	default:
-		return parseResetNumberString(strings.TrimSpace(fmt.Sprint(typed)), now, false)
+		return parseResetNumberString(strings.TrimSpace(fmt.Sprint(typed)), now, relative)
 	}
-}
-
-func parseRetryAfterValue(value any, now time.Time) (time.Time, bool) {
-	switch typed := value.(type) {
-	case []any:
-		for _, item := range typed {
-			if resetAt, ok := parseRetryAfterValue(item, now); ok {
-				return resetAt, true
-			}
-		}
-		return time.Time{}, false
-	case string:
-		text := strings.TrimSpace(typed)
-		if text == "" {
-			return time.Time{}, false
-		}
-		if seconds, err := strconv.ParseFloat(text, 64); err == nil && seconds > 0 {
-			return now.Add(time.Duration(seconds * float64(time.Second))), true
-		}
-		if parsed, err := http.ParseTime(text); err == nil {
-			return parsed, true
-		}
-		return time.Time{}, false
-	case json.Number:
-		seconds, err := strconv.ParseFloat(typed.String(), 64)
-		if err == nil && seconds > 0 {
-			return now.Add(time.Duration(seconds * float64(time.Second))), true
-		}
-	case float64:
-		if typed > 0 {
-			return now.Add(time.Duration(typed * float64(time.Second))), true
-		}
-	case int:
-		if typed > 0 {
-			return now.Add(time.Duration(typed) * time.Second), true
-		}
-	case int64:
-		if typed > 0 {
-			return now.Add(time.Duration(typed) * time.Second), true
-		}
-	}
-	return time.Time{}, false
 }
 
 func parseResetNumberString(text string, now time.Time, relative bool) (time.Time, bool) {
 	if text == "" || strings.EqualFold(text, "null") {
 		return time.Time{}, false
 	}
-	if parsed, ok := parseCommonTime(text); ok {
-		return parsed, true
+	if !relative {
+		if parsed, ok := parseCommonTime(text); ok {
+			return parsed, true
+		}
 	}
 	value, err := strconv.ParseFloat(text, 64)
 	if err != nil || value <= 0 {
@@ -426,13 +441,9 @@ func resetTimeFromNumber(value float64, now time.Time, relative bool) (time.Time
 	if value > 1_000_000_000_000 {
 		return time.UnixMilli(int64(value)), true
 	}
-	// Unix seconds, e.g. Codex rate_limit.reset_at.
+	// Unix seconds.
 	if value > 1_000_000_000 {
 		return time.Unix(int64(value), 0), true
-	}
-	// Some providers return seconds-until-reset in a reset field.
-	if value < 366*24*60*60 {
-		return now.Add(time.Duration(value * float64(time.Second))), true
 	}
 	return time.Time{}, false
 }
@@ -455,52 +466,140 @@ func parseCommonTime(text string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-var plainResetPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)(retry-after|retry_after)\D{0,20}(\d+(?:\.\d+)?)`),
-	regexp.MustCompile(`(?i)(reset(?:s)?(?:[_ -]?at|[_ -]?time)?)\D{0,40}(\d{10,13}|\d+(?:\.\d+)?)`),
-}
-
-func resetTimeFromPlainText(text string, now time.Time) (time.Time, bool) {
-	for _, pattern := range plainResetPatterns {
-		match := pattern.FindStringSubmatch(text)
-		if len(match) < 3 {
+func (w *RateLimitAutoDisableWorker) currentAuthFile(ctx context.Context, baseURL string, managementKey string, fileName string, authIndex string) (authFile, bool, error) {
+	files, err := w.fetchAuthFiles(ctx, baseURL, managementKey)
+	if err != nil {
+		return nil, false, err
+	}
+	fileName = strings.TrimSpace(fileName)
+	authIndex = strings.TrimSpace(authIndex)
+	for _, file := range files {
+		if authFileName(file) != fileName {
 			continue
 		}
-		keyHint := match[1]
-		if isRetryAfterKey(keyHint) {
-			return parseRetryAfterValue(match[2], now)
+		if authIndex != "" && authFileAuthIndex(file) != authIndex {
+			continue
 		}
-		if resetAt, ok := parseResetNumberString(match[2], now, false); ok {
-			return resetAt, true
+		return file, true, nil
+	}
+	return nil, false, nil
+}
+
+func (w *RateLimitAutoDisableWorker) fetchAuthFiles(ctx context.Context, baseURL string, managementKey string) ([]authFile, error) {
+	base := cpa.NormalizeBaseURL(baseURL)
+	paths := []string{
+		base + "/auth-files",
+		base + "/v0/management/auth-files",
+	}
+	client := w.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	var endpointErrors []string
+	for _, endpoint := range paths {
+		reqCtx, cancel := context.WithTimeout(ctx, quotaAutoDisableActionTimeout)
+		req, reqErr := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
+		if reqErr != nil {
+			cancel()
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: %v", endpoint, reqErr))
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+managementKey)
+		res, doErr := client.Do(req)
+		cancel()
+		if doErr != nil {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: %v", endpoint, doErr))
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		_ = res.Body.Close()
+		if res.StatusCode < 200 || res.StatusCode >= 300 {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: HTTP %d %s", endpoint, res.StatusCode, strings.TrimSpace(string(body))))
+			continue
+		}
+		files, err := parseAuthFiles(body)
+		if err != nil {
+			endpointErrors = append(endpointErrors, fmt.Sprintf("%s: %v", endpoint, err))
+			continue
+		}
+		return files, nil
+	}
+	if len(endpointErrors) == 0 {
+		return nil, errors.New("no auth-file endpoint attempted")
+	}
+	return nil, fmt.Errorf("all auth-file endpoints failed: %s", strings.Join(endpointErrors, "; "))
+}
+
+func parseAuthFiles(body []byte) ([]authFile, error) {
+	var decoded any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&decoded); err != nil {
+		return nil, err
+	}
+	files := authFilesFromJSON(decoded)
+	if files == nil {
+		return []authFile{}, nil
+	}
+	return files, nil
+}
+
+func authFilesFromJSON(value any) []authFile {
+	switch typed := value.(type) {
+	case []any:
+		files := make([]authFile, 0, len(typed))
+		for _, item := range typed {
+			if m, ok := item.(map[string]any); ok {
+				files = append(files, authFile(m))
+			}
+		}
+		return files
+	case map[string]any:
+		for _, key := range []string{"auth_files", "authFiles", "files", "items", "data"} {
+			if child, ok := typed[key]; ok {
+				if files := authFilesFromJSON(child); files != nil {
+					return files
+				}
+			}
 		}
 	}
-	return time.Time{}, false
+	return nil
 }
 
-func isResetKey(key string) bool {
-	normalized := normalizeKey(key)
-	return normalized == "resetat" ||
-		normalized == "resettime" ||
-		normalized == "resetsat" ||
-		normalized == "ratelimitresetat" ||
-		normalized == "ratelimitreset" ||
-		normalized == "xratelimitreset"
+func authFileName(file authFile) string {
+	return firstNonEmpty(stringField(file, "name"), stringField(file, "file_name"), stringField(file, "fileName"), stringField(file, "id"))
 }
 
-func isRetryAfterKey(key string) bool {
-	normalized := normalizeKey(key)
-	return normalized == "retryafter"
+func authFileAuthIndex(file authFile) string {
+	return firstNonEmpty(stringField(file, "auth_index"), stringField(file, "authIndex"), stringField(file, "auth-index"))
 }
 
-func normalizeKey(key string) string {
-	key = strings.ToLower(strings.TrimSpace(key))
-	var b strings.Builder
-	for _, r := range key {
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
-			b.WriteRune(r)
+func authFileDisabled(file authFile) bool {
+	if raw, ok := file["disabled"]; ok {
+		switch value := raw.(type) {
+		case bool:
+			return value
+		case json.Number:
+			parsed, _ := strconv.ParseFloat(value.String(), 64)
+			return parsed != 0
+		case float64:
+			return value != 0
+		case string:
+			return strings.EqualFold(strings.TrimSpace(value), "true") || strings.TrimSpace(value) == "1"
 		}
 	}
-	return b.String()
+	status := strings.ToLower(firstNonEmpty(stringField(file, "status"), stringField(file, "state")))
+	return status == "disabled" || status == "inactive"
+}
+
+func stringField(file authFile, key string) string {
+	if file == nil {
+		return ""
+	}
+	if value, ok := file[key]; ok && value != nil {
+		return strings.TrimSpace(fmt.Sprint(value))
+	}
+	return ""
 }
 
 func (w *RateLimitAutoDisableWorker) disableAuthFile(ctx context.Context, baseURL string, managementKey string, fileName string) error {

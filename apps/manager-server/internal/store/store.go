@@ -9,6 +9,7 @@ import (
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/codexinspection"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/deadletter"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/modelprice"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/quotacooldown"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/setting"
 	sqliterepo "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/sqlite"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/usageevent"
@@ -32,6 +33,8 @@ type InsertResult = model.InsertResult
 type ModelPrice = model.ModelPrice
 type ModelPriceSyncResult = model.ModelPriceSyncResult
 type APIKeyAlias = model.APIKeyAlias
+type QuotaCooldown = model.QuotaCooldown
+type QuotaCooldownUpsert = model.QuotaCooldownUpsert
 
 var DefaultCodexInspectionConfig = model.DefaultCodexInspectionConfig
 var NormalizeCodexInspectionConfig = model.NormalizeCodexInspectionConfig
@@ -60,6 +63,7 @@ type Store struct {
 	ModelPrices      modelprice.Repository
 	APIKeyAliases    apikeyalias.Repository
 	CodexInspections codexinspection.Repository
+	QuotaCooldowns   quotacooldown.Repository
 }
 
 func Open(path string, protector ...*security.Protector) (*Store, error) {
@@ -79,6 +83,7 @@ func New(db *sql.DB, protector ...*security.Protector) *Store {
 		ModelPrices:      modelprice.New(db),
 		APIKeyAliases:    apikeyalias.New(db),
 		CodexInspections: codexinspection.New(db),
+		QuotaCooldowns:   quotacooldown.New(db),
 	}
 }
 
@@ -191,6 +196,26 @@ func (s *Store) ListCodexInspectionLogs(ctx context.Context, runID int64) ([]Cod
 
 func (s *Store) InsertEvents(ctx context.Context, events []usage.Event) (InsertResult, error) {
 	return s.UsageEvents.InsertBatch(ctx, events)
+}
+
+func (s *Store) UpsertQuotaCooldown(ctx context.Context, cooldown QuotaCooldownUpsert) (QuotaCooldown, error) {
+	return s.QuotaCooldowns.UpsertActive(ctx, cooldown)
+}
+
+func (s *Store) ListDueQuotaCooldowns(ctx context.Context, nowMS int64, limit int) ([]QuotaCooldown, error) {
+	return s.QuotaCooldowns.ListDue(ctx, nowMS, limit)
+}
+
+func (s *Store) MarkQuotaCooldownRecovered(ctx context.Context, id int64, recoveredAtMS int64) error {
+	return s.QuotaCooldowns.MarkRecovered(ctx, id, recoveredAtMS)
+}
+
+func (s *Store) MarkQuotaCooldownSkipped(ctx context.Context, id int64, reason string) error {
+	return s.QuotaCooldowns.MarkSkipped(ctx, id, reason)
+}
+
+func (s *Store) RecordQuotaCooldownFailure(ctx context.Context, id int64, reason string) error {
+	return s.QuotaCooldowns.RecordFailure(ctx, id, reason)
 }
 
 func (s *Store) AddDeadLetter(ctx context.Context, payload string, parseErr error) error {

@@ -76,9 +76,17 @@ func runServer() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	rateLimitAutoDisableWorker := worker.NewRateLimitAutoDisableWorker(db)
-	manager.SetUsageEventHandler(rateLimitAutoDisableWorker)
-	rateLimitAutoDisableWorker.Start(ctx)
+	if cfg.QuotaCooldownEnabled {
+		rateLimitAutoDisableWorker := worker.NewRateLimitAutoDisableWorker(db, collector.RuntimeConfig{
+			CPAUpstreamURL: cfg.CPAUpstreamURL,
+			ManagementKey:  cfg.ManagementKey,
+		})
+		manager.SetUsageEventHandler(rateLimitAutoDisableWorker)
+		rateLimitAutoDisableWorker.Start(ctx)
+		log.Printf("quota cooldown worker enabled")
+	} else {
+		log.Printf("quota cooldown worker disabled (set USAGE_QUOTA_COOLDOWN_ENABLED=1 to enable)")
+	}
 
 	collectorWorker.Start(ctx)
 
