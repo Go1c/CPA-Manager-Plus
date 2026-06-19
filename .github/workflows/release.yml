@@ -220,3 +220,33 @@ jobs:
           repository: ${{ env.DOCKERHUB_IMAGE }}
           short-description: CPA Manager Plus with Dockerized Manager Server
           readme-filepath: ./README.md
+
+  deploy-production:
+    needs: build-and-push-docker
+    runs-on: ubuntu-latest
+    if: ${{ vars.PRODUCTION_DEPLOY_ENABLED == 'true' }}
+
+    steps:
+      - name: Prepare SSH
+        env:
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+          PROD_SSH_KNOWN_HOSTS: ${{ secrets.PROD_SSH_KNOWN_HOSTS }}
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "$PROD_SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$PROD_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "$PROD_HOST" > ~/.ssh/known_hosts
+          fi
+
+      - name: Deploy to production
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+        run: |
+          ssh "${PROD_USER:-deploy}@${PROD_HOST}" \
+            "/opt/lumio/bin/deploy-cpa-manager.sh 'ghcr.io/go1c/cpa-manager-plus:${{ github.ref_name }}'"
