@@ -2872,7 +2872,11 @@
     "sort_default": "По умолчанию",
     "sort_name_asc": "Имя A-Z",
     "sort_plan_desc": "План от высокого",
-    "sort_plan_asc": "План от низкого"
+    "sort_plan_asc": "План от низкого",
+    "account_display_masked": "Скрыто",
+    "account_display_full": "Полностью",
+    "show_full_credentials_hint": "Показать полные идентификаторы учётных данных",
+    "show_masked_credentials_hint": "Показать скрытые идентификаторы учётных данных"
   },
   "codex_reauth": {
     "title": "Повторный вход Codex",

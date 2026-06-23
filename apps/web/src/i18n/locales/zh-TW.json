@@ -2847,7 +2847,11 @@
     "sort_default": "預設順序",
     "sort_name_asc": "名稱 A-Z",
     "sort_plan_desc": "方案高到低",
-    "sort_plan_asc": "方案低到高"
+    "sort_plan_asc": "方案低到高",
+    "account_display_masked": "脫敏",
+    "account_display_full": "完整",
+    "show_full_credentials_hint": "顯示完整憑證標識",
+    "show_masked_credentials_hint": "顯示脫敏憑證標識"
   },
   "codex_reauth": {
     "title": "Codex 重新登入",

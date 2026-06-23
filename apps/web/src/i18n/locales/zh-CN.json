@@ -2822,7 +2822,11 @@
     "sort_default": "默认顺序",
     "sort_name_asc": "名称 A-Z",
     "sort_plan_desc": "套餐高到低",
-    "sort_plan_asc": "套餐低到高"
+    "sort_plan_asc": "套餐低到高",
+    "account_display_masked": "脱敏",
+    "account_display_full": "完整",
+    "show_full_credentials_hint": "显示完整凭证标识",
+    "show_masked_credentials_hint": "显示脱敏凭证标识"
   },
   "codex_reauth": {
     "title": "Codex 重新登录",

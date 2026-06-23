@@ -2876,7 +2876,11 @@
     "sort_default": "Default order",
     "sort_name_asc": "Name A-Z",
     "sort_plan_desc": "Plan high to low",
-    "sort_plan_asc": "Plan low to high"
+    "sort_plan_asc": "Plan low to high",
+    "account_display_masked": "Masked",
+    "account_display_full": "Full",
+    "show_full_credentials_hint": "Show full credential identifiers",
+    "show_masked_credentials_hint": "Show masked credential identifiers"
   },
   "codex_reauth": {
     "title": "Codex Re-login",
