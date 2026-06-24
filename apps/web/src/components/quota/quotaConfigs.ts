@@ -18,6 +18,7 @@ import type {
   XaiBillingSummary,
   XaiQuotaState,
 } from '@/types';
+import type { UsageHeaderSnapshot } from '@/services/api/usageService';
 import type { AntigravityQuotaData } from '@/utils/quota';
 import { resetCodexQuota } from '@/services/api/codexQuota';
 import {
@@ -31,6 +32,7 @@ import {
   fetchCodexQuota,
   fetchKimiQuota,
   fetchXaiQuota,
+  buildCodexQuotaWindows,
   isAntigravityFile,
   isClaudeFile,
   isCodexFile,
@@ -38,6 +40,16 @@ import {
   isKimiFile,
   isXaiFile,
 } from '@/utils/quota';
+import {
+  buildObservedCodexQuotaFromHeaderSnapshot,
+  getHeaderSnapshotErrorCode,
+  getHeaderSnapshotErrorKind,
+  getHeaderSnapshotPlanType,
+  getHeaderSnapshotRecoverAtMs,
+  getHeaderSnapshotTraceId,
+  getHeaderSnapshotUsedPercent,
+  hasUsageHeaderSnapshotSignal,
+} from '@/utils/usageHeaderSnapshots';
 import type { QuotaRenderHelpers } from './QuotaCard';
 import styles from '@/features/quota/QuotaPage.module.scss';
 
@@ -79,6 +91,11 @@ export interface QuotaConfig<TState, TData> {
   gridClassName: string;
   getSearchText?: (file: AuthFileItem, quota: TState | undefined, t: TFunction) => unknown[];
   getPlanSortRank?: (file: AuthFileItem, quota: TState | undefined) => number | null;
+  buildObservedState?: (
+    file: AuthFileItem,
+    snapshot: UsageHeaderSnapshot | undefined,
+    t: TFunction
+  ) => TState | undefined;
   resetQuota?: (file: AuthFileItem, t: TFunction) => Promise<TData>;
   canResetQuota?: (file: AuthFileItem, quota: TState | undefined) => boolean;
   renderQuotaItems: (quota: TState, t: TFunction, helpers: QuotaRenderHelpers) => ReactNode;
@@ -119,38 +136,38 @@ const renderAntigravityItems = (
       return [
         ...groupHeader,
         ...group.buckets.map((bucket) => {
-        const clamped = Math.max(0, Math.min(1, bucket.remainingFraction));
-        const percent = Math.round(clamped * 100);
-        const resetMs = bucket.resetTime ? new Date(bucket.resetTime).getTime() : Number.NaN;
-        const resetLabel =
-          bucket.resetTime && !Number.isNaN(resetMs) && resetMs <= nowMs
-            ? t('antigravity_quota.refresh_available')
-            : formatQuotaResetTime(bucket.resetTime);
+          const clamped = Math.max(0, Math.min(1, bucket.remainingFraction));
+          const percent = Math.round(clamped * 100);
+          const resetMs = bucket.resetTime ? new Date(bucket.resetTime).getTime() : Number.NaN;
+          const resetLabel =
+            bucket.resetTime && !Number.isNaN(resetMs) && resetMs <= nowMs
+              ? t('antigravity_quota.refresh_available')
+              : formatQuotaResetTime(bucket.resetTime);
 
-        return h(
-          'div',
-          { key: `${group.id}-${bucket.id}`, className: styleMap.quotaRow },
-          h(
+          return h(
             'div',
-            { className: styleMap.quotaRowHeader },
-            h(
-              'span',
-              { className: styleMap.quotaModel, title: bucket.description },
-              bucket.label
-            ),
+            { key: `${group.id}-${bucket.id}`, className: styleMap.quotaRow },
             h(
               'div',
-              { className: styleMap.quotaMeta },
-              h('span', { className: styleMap.quotaPercent }, `${percent}%`),
-              h('span', { className: styleMap.quotaReset }, resetLabel)
-            )
-          ),
-          h(QuotaProgressBar, {
-            percent,
-            highThreshold: QUOTA_PROGRESS_HIGH_THRESHOLD,
-            mediumThreshold: QUOTA_PROGRESS_MEDIUM_THRESHOLD,
-          })
-        );
+              { className: styleMap.quotaRowHeader },
+              h(
+                'span',
+                { className: styleMap.quotaModel, title: bucket.description },
+                bucket.label
+              ),
+              h(
+                'div',
+                { className: styleMap.quotaMeta },
+                h('span', { className: styleMap.quotaPercent }, `${percent}%`),
+                h('span', { className: styleMap.quotaReset }, resetLabel)
+              )
+            ),
+            h(QuotaProgressBar, {
+              percent,
+              highThreshold: QUOTA_PROGRESS_HIGH_THRESHOLD,
+              mediumThreshold: QUOTA_PROGRESS_MEDIUM_THRESHOLD,
+            })
+          );
         }),
       ];
     })
@@ -194,7 +211,81 @@ const getCodexSearchText = (
   const planType = getCodexEffectivePlanType(file, quota);
   const planLabel = getCodexPlanLabel(planType, t);
   const accountId = resolveCodexChatgptAccountId(file);
-  return [planType, planLabel, accountId];
+  return [
+    planType,
+    planLabel,
+    accountId,
+    quota?.observedErrorKind,
+    quota?.observedErrorCode,
+    quota?.observedTraceId,
+    quota?.activeLimit,
+    quota?.creditsHasCredits,
+    quota?.creditsUnlimited,
+    quota?.creditsBalance,
+    quota?.rateLimitReachedType,
+    quota?.primaryOverSecondaryLimitPercent,
+    quota?.observedAtMs,
+  ];
+};
+
+export const buildObservedCodexQuotaState = (
+  file: AuthFileItem,
+  snapshot: UsageHeaderSnapshot | undefined,
+  t: TFunction
+): CodexQuotaState | undefined => {
+  if (!hasUsageHeaderSnapshotSignal(snapshot)) return undefined;
+  const observedQuota = buildObservedCodexQuotaFromHeaderSnapshot(snapshot);
+  const usedPercent = getHeaderSnapshotUsedPercent(snapshot);
+  const recoverAtMS = getHeaderSnapshotRecoverAtMs(snapshot);
+  const recoverLabel = recoverAtMS ? new Date(recoverAtMS).toLocaleString() : '-';
+  const headerPlanType = observedQuota?.planType || getHeaderSnapshotPlanType(snapshot);
+  const planType = resolveCodexPlanType(file) ?? (headerPlanType || null);
+  const observedWindows = observedQuota?.payload
+    ? buildCodexQuotaWindows(observedQuota.payload, t, planType)
+    : [];
+  const windows: CodexQuotaWindow[] =
+    observedWindows.length > 0
+      ? observedWindows
+      : usedPercent !== null || recoverAtMS
+        ? [
+            {
+              id: 'usage-header-observed',
+              label: t('codex_quota.observed_window', {
+                defaultValue: 'Latest request',
+              }),
+              usedPercent,
+              resetLabel: recoverLabel,
+            },
+          ]
+        : [];
+
+  return {
+    status: 'success',
+    windows,
+    planType,
+    activeLimit: observedQuota?.activeLimit ?? null,
+    creditsHasCredits: observedQuota?.creditsHasCredits ?? null,
+    creditsUnlimited: observedQuota?.creditsUnlimited ?? null,
+    creditsBalance: observedQuota?.creditsBalance ?? null,
+    rateLimitReachedType: observedQuota?.rateLimitReachedType ?? null,
+    primaryOverSecondaryLimitPercent: observedQuota?.primaryOverSecondaryLimitPercent ?? null,
+    observedFromUsageHeaders: true,
+    observedResetCreditsUnknown: true,
+    observedAtMs: snapshot?.timestamp_ms,
+    observedTraceId: getHeaderSnapshotTraceId(snapshot),
+    observedErrorKind: getHeaderSnapshotErrorKind(snapshot),
+    observedErrorCode: getHeaderSnapshotErrorCode(snapshot),
+  };
+};
+
+const formatCodexCreditsLabel = (quota: CodexQuotaState, t: TFunction): string | null => {
+  if (quota.creditsUnlimited === true) return t('codex_quota.credits_unlimited');
+  if (quota.creditsHasCredits === true) {
+    const base = t('codex_quota.credits_available');
+    return quota.creditsBalance ? `${base} ${quota.creditsBalance}` : base;
+  }
+  if (quota.creditsHasCredits === false) return t('codex_quota.credits_unavailable');
+  return quota.creditsBalance ?? null;
 };
 
 const renderCodexItems = (
@@ -210,11 +301,35 @@ const renderCodexItems = (
   const isPremiumPlan = PREMIUM_CODEX_PLAN_TYPES.has(normalizePlanType(planType) ?? '');
   const resetCreditsAvailableCount = quota.rateLimitResetCreditsAvailableCount;
   const hasResetCreditsAvailableCount =
-    typeof resetCreditsAvailableCount === 'number' &&
-    Number.isFinite(resetCreditsAvailableCount);
+    typeof resetCreditsAvailableCount === 'number' && Number.isFinite(resetCreditsAvailableCount);
+  const creditsLabel = formatCodexCreditsLabel(quota, t);
+  const hasPrimaryOverSecondaryLimitPercent =
+    typeof quota.primaryOverSecondaryLimitPercent === 'number' &&
+    Number.isFinite(quota.primaryOverSecondaryLimitPercent);
   const nodes: ReactNode[] = [];
 
-  if (planLabel || hasResetCreditsAvailableCount) {
+  if (quota.observedFromUsageHeaders) {
+    const observedAt =
+      quota.observedAtMs && Number.isFinite(quota.observedAtMs)
+        ? new Date(quota.observedAtMs).toLocaleString()
+        : '';
+    nodes.push(
+      h(
+        'div',
+        { key: 'observed-source', className: styleMap.quotaMessage },
+        observedAt
+          ? t('quota_management.observed_from_usage_headers_at', {
+              time: observedAt,
+              defaultValue: `Observed from latest usage response headers · ${observedAt}`,
+            })
+          : t('quota_management.observed_from_usage_headers', {
+              defaultValue: 'Observed from latest usage response headers',
+            })
+      )
+    );
+  }
+
+  if (planLabel || hasResetCreditsAvailableCount || quota.observedResetCreditsUnknown) {
     const valueClass = isPremiumPlan ? styleMap.premiumPlanValue : styleMap.codexPlanValue;
     const planNodes: ReactNode[] = [];
 
@@ -229,7 +344,7 @@ const renderCodexItems = (
       );
     }
 
-    if (hasResetCreditsAvailableCount) {
+    if (hasResetCreditsAvailableCount || quota.observedResetCreditsUnknown) {
       if (planNodes.length > 0) {
         planNodes.push(
           h('span', { key: 'reset-separator', className: styleMap.codexPlanLabel }, '|')
@@ -244,17 +359,97 @@ const renderCodexItems = (
         h(
           'span',
           { key: 'reset-value', className: styleMap.codexPlanValue },
-          String(resetCreditsAvailableCount)
+          hasResetCreditsAvailableCount
+            ? String(resetCreditsAvailableCount)
+            : t('codex_quota.reset_credits_unknown')
+        )
+      );
+    }
+
+    nodes.push(h('div', { key: 'plan', className: styleMap.codexPlan }, ...planNodes));
+  }
+
+  if (quota.activeLimit || creditsLabel) {
+    const metaNodes: ReactNode[] = [];
+
+    if (quota.activeLimit) {
+      metaNodes.push(
+        h(
+          'span',
+          { key: 'active-limit-label', className: styleMap.codexPlanLabel },
+          t('codex_quota.active_limit_label')
+        ),
+        h(
+          'span',
+          { key: 'active-limit-value', className: styleMap.codexPlanValue },
+          quota.activeLimit
+        )
+      );
+    }
+
+    if (creditsLabel) {
+      if (metaNodes.length > 0) {
+        metaNodes.push(
+          h('span', { key: 'credits-separator', className: styleMap.codexPlanLabel }, '|')
+        );
+      }
+      metaNodes.push(
+        h(
+          'span',
+          { key: 'credits-label', className: styleMap.codexPlanLabel },
+          t('codex_quota.credits_label')
+        ),
+        h('span', { key: 'credits-value', className: styleMap.codexPlanValue }, creditsLabel)
+      );
+    }
+
+    nodes.push(h('div', { key: 'header-quota-meta', className: styleMap.codexPlan }, ...metaNodes));
+  }
+
+  if (quota.rateLimitReachedType || hasPrimaryOverSecondaryLimitPercent) {
+    const limitNodes: ReactNode[] = [];
+
+    if (quota.rateLimitReachedType) {
+      limitNodes.push(
+        h(
+          'span',
+          { key: 'reached-type-label', className: styleMap.codexPlanLabel },
+          t('codex_quota.rate_limit_reached_type_label')
+        ),
+        h(
+          'span',
+          { key: 'reached-type-value', className: styleMap.codexPlanValue },
+          quota.rateLimitReachedType
+        )
+      );
+    }
+
+    if (hasPrimaryOverSecondaryLimitPercent) {
+      if (limitNodes.length > 0) {
+        limitNodes.push(
+          h(
+            'span',
+            { key: 'primary-over-secondary-separator', className: styleMap.codexPlanLabel },
+            '|'
+          )
+        );
+      }
+      limitNodes.push(
+        h(
+          'span',
+          { key: 'primary-over-secondary-label', className: styleMap.codexPlanLabel },
+          t('codex_quota.primary_over_secondary_limit_label')
+        ),
+        h(
+          'span',
+          { key: 'primary-over-secondary-value', className: styleMap.codexPlanValue },
+          `${quota.primaryOverSecondaryLimitPercent}%`
         )
       );
     }
 
     nodes.push(
-      h(
-        'div',
-        { key: 'plan', className: styleMap.codexPlan },
-        ...planNodes
-      )
+      h('div', { key: 'header-limit-meta', className: styleMap.codexPlan }, ...limitNodes)
     );
   }
 
@@ -472,6 +667,7 @@ export const CODEX_CONFIG: QuotaConfig<
   gridClassName: styles.codexGrid,
   getSearchText: getCodexSearchText,
   getPlanSortRank: getCodexPlanSortRank,
+  buildObservedState: buildObservedCodexQuotaState,
   resetQuota: resetCodexQuota,
   canResetQuota: (_file, quota) =>
     quota?.status === 'success' && (quota.rateLimitResetCreditsAvailableCount ?? 0) > 0,
