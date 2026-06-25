@@ -119,6 +119,30 @@ func TestParseResponseHeaderMetadataIgnoresNonScalarHeaderValues(t *testing.T) {
 	}
 }
 
+func TestParseResponseHeaderMetadataIgnoresFutureHeaderCandidates(t *testing.T) {
+	metadata := ParseResponseHeaderMetadata(map[string]any{
+		"X-Error-JSON":               []any{"eyJlcnJvciI6eyJjb2RlIjoidG9rZW5fcmV2b2tlZCJ9fQ=="},
+		"X-Codex-Promo-Message":      []any{"Start a free trial of Plus today"},
+		"X-Codex-Promo-Campaign-ID":  []any{"plus-1-month-free"},
+		"X-OpenAI-Internal-Caller":   []any{"unknown_through_ide"},
+		"X-Zeabur-IP-Country":        []any{"US"},
+		"Date":                       []any{"Tue, 23 Jun 2026 10:48:17 GMT"},
+		"Cache-Control":              []any{"no-cache"},
+		"Strict-Transport-Security":  []any{"max-age=31536000"},
+		"Content-Security-Policy":    []any{"default-src 'none'"},
+		"X-Content-Type-Options":     []any{"nosniff"},
+		"Cross-Origin-Opener-Policy": []any{"same-origin-allow-popups"},
+		"Timing-Allow-Origin":        []any{"*"},
+		"Alt-Svc":                    []any{`h3=":443"; ma=86400`},
+		"Nel":                        []any{`{"max_age":604800}`},
+		"Report-To":                  []any{`{"group":"cf-nel"}`},
+		"X-Frame-Options":            []any{"DENY"},
+	}, time.Unix(1_780_000_000, 0))
+	if metadata != nil {
+		t.Fatalf("future header candidates should not be structured yet: %#v", metadata)
+	}
+}
+
 func TestResponseHeaderMetadataFromRecordSanitizesImportedMetadata(t *testing.T) {
 	metadata := ResponseHeaderMetadataFromRecord(map[string]any{
 		"response_metadata": map[string]any{

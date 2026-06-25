@@ -23,7 +23,7 @@ func (r *repository) BackfillResponseMetadata(ctx context.Context, batchLimit in
 from usage_events
 where response_metadata_json is null
 and raw_json is not null
-and raw_json like '%response_headers%'
+and (raw_json like '%response_headers%' or raw_json like '%responseHeaders%')
 order by id
 limit ?`, batchLimit)
 	if err != nil {

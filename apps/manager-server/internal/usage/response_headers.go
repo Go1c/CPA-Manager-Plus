@@ -348,6 +348,19 @@ func normalizeResponseHeaders(raw any) map[string][]string {
 	return headers
 }
 
+// Future response-header candidates observed in real CPA usage data but not
+// structured yet:
+//   - x-error-json: base64/error JSON that can enrich auth-action evidence after
+//     a dedicated redaction and parsing path exists.
+//   - x-codex-promo-message and x-codex-promo-campaign-id: low-volume Codex
+//     upgrade hints that may become a quota-page informational notice.
+//   - x-openai-internal-caller and x-zeabur-ip-country: deployment/source
+//     diagnostics that need clearer UI semantics before exposure.
+//   - date, cache-control, alt-svc, and security-policy headers: high-volume,
+//     low-business-value transport data intentionally kept out of structured
+//     filters to avoid noisy UI and expensive distinct queries.
+//   - x-models-etag and x-new-api-version are already retained under routing;
+//     future work can correlate them with model-list or proxy-version changes.
 func isResponseHeaderAllowed(key string) bool {
 	if key == "set-cookie" ||
 		strings.Contains(key, "token") ||
