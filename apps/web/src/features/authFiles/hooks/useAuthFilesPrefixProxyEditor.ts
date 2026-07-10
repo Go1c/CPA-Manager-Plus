@@ -17,7 +17,8 @@ type AuthFileHeadersErrorKey =
   | 'auth_files.headers_invalid_object'
   | 'auth_files.headers_invalid_value';
 type AuthFileContentErrorKey =
-  'auth_files.prefix_proxy_invalid_json' | 'auth_files.prefix_proxy_html_challenge';
+  | 'auth_files.prefix_proxy_invalid_json'
+  | 'auth_files.prefix_proxy_html_challenge';
 
 export type PrefixProxyEditorField =
   | 'prefix'
@@ -80,6 +81,7 @@ export type UseAuthFilesPrefixProxyEditorResult = {
     field: PrefixProxyEditorField,
     value: PrefixProxyEditorFieldValue
   ) => void;
+  handlePrefixProxyTest: () => Promise<void>;
   handlePrefixProxySave: () => Promise<void>;
 };
 
@@ -181,13 +183,21 @@ export const buildStructuredProxyURL = (editor: PrefixProxyEditorState): string 
 };
 
 const extractProxyTestResult = (error: unknown): ProxyTestResult | null => {
-  if (!error || typeof error !== 'object' || !('response' in error)) return null;
-  const response = (error as { response?: { data?: unknown } }).response;
-  const data = response?.data;
-  if (!data || typeof data !== 'object') return null;
-  const record = data as Record<string, unknown>;
-  if (typeof record.code !== 'string') return null;
-  return record as unknown as ProxyTestResult;
+  if (!error || typeof error !== 'object') return null;
+  const candidate = error as {
+    response?: { data?: unknown };
+    data?: unknown;
+    details?: unknown;
+  };
+  const values = [candidate.response?.data, candidate.data, candidate.details];
+  for (const value of values) {
+    if (!value || typeof value !== 'object') continue;
+    const record = value as Record<string, unknown>;
+    if (typeof record.code === 'string') {
+      return record as unknown as ProxyTestResult;
+    }
+  }
+  return null;
 };
 
 const INVALID_CONTENT_PREVIEW_LIMIT = 1000;
@@ -638,6 +648,56 @@ export function useAuthFilesPrefixProxyEditor(
     });
   };
 
+  const handlePrefixProxyTest = async () => {
+    if (!prefixProxyEditor?.json || prefixProxyEditor.providerKey !== 'codex') return;
+    if (prefixProxyEditor.saving || prefixProxyEditor.testingProxy) return;
+
+    const name = prefixProxyEditor.fileName;
+    let proxyURL: string;
+    try {
+      proxyURL = buildStructuredProxyURL(prefixProxyEditor);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : 'Invalid proxy URL';
+      showNotification(errorMessage, 'error');
+      setPrefixProxyEditor((prev) => {
+        if (!prev || prev.fileName !== name) return prev;
+        return { ...prev, error: errorMessage, proxyTestResult: null };
+      });
+      return;
+    }
+
+    setPrefixProxyEditor((prev) => {
+      if (!prev || prev.fileName !== name) return prev;
+      return { ...prev, testingProxy: true, proxyTestResult: null, error: null };
+    });
+
+    try {
+      const result = await authFilesApi.testProxy(proxyURL, prefixProxyEditor.providerKey, name);
+      setPrefixProxyEditor((prev) => {
+        if (!prev || prev.fileName !== name) return prev;
+        return { ...prev, testingProxy: false, proxyTestResult: result, error: null };
+      });
+      showNotification(
+        result.ok ? t('auth_files.proxy_test_success') : t('auth_files.proxy_test_failed'),
+        result.ok ? 'success' : 'error'
+      );
+    } catch (err: unknown) {
+      const proxyTestResult = extractProxyTestResult(err);
+      const errorMessage =
+        proxyTestResult?.message ?? (err instanceof Error ? err.message : 'Proxy test failed');
+      setPrefixProxyEditor((prev) => {
+        if (!prev || prev.fileName !== name) return prev;
+        return {
+          ...prev,
+          testingProxy: false,
+          proxyTestResult,
+          error: proxyTestResult ? null : errorMessage,
+        };
+      });
+      showNotification(`${t('auth_files.proxy_test_failed')}: ${errorMessage}`, 'error');
+    }
+  };
+
   const handlePrefixProxySave = async () => {
     if (!prefixProxyEditor?.json) return;
     if (!prefixProxyDirty) return;
@@ -725,6 +785,7 @@ export function useAuthFilesPrefixProxyEditor(
     openPrefixProxyEditor,
     closePrefixProxyEditor,
     handlePrefixProxyChange,
+    handlePrefixProxyTest,
     handlePrefixProxySave,
   };
 }

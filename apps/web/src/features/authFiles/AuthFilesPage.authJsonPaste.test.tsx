@@ -126,6 +126,7 @@ vi.mock('@/features/authFiles/hooks/useAuthFilesPrefixProxyEditor', () => ({
     openPrefixProxyEditor: vi.fn(),
     closePrefixProxyEditor: vi.fn(),
     handlePrefixProxyChange: vi.fn(),
+    handlePrefixProxyTest: vi.fn(async () => undefined),
     handlePrefixProxySave: vi.fn(async () => undefined),
   }),
 }));

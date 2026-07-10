@@ -366,6 +366,7 @@ export function AuthFilesPage() {
     openPrefixProxyEditor,
     closePrefixProxyEditor,
     handlePrefixProxyChange,
+    handlePrefixProxyTest,
     handlePrefixProxySave,
   } = useAuthFilesPrefixProxyEditor({
     disableControls: connectionStatus !== 'connected',
@@ -1825,6 +1826,7 @@ export function AuthFilesPage() {
         dirty={prefixProxyDirty}
         onClose={closePrefixProxyEditor}
         onCopyText={copyTextWithNotification}
+        onTestProxy={handlePrefixProxyTest}
         onSave={handlePrefixProxySave}
         onChange={handlePrefixProxyChange}
       />

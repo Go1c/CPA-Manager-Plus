@@ -41,6 +41,7 @@ const { mocks } = vi.hoisted(() => {
       openPrefixProxyEditor: vi.fn(),
       closePrefixProxyEditor: vi.fn(),
       handlePrefixProxyChange: vi.fn(),
+      handlePrefixProxyTest: vi.fn(async () => undefined),
       handlePrefixProxySave: vi.fn(async () => undefined),
       codexQuota: {} as Record<string, unknown>,
       lastCodexInspectionLastRun: null as {
@@ -192,6 +193,7 @@ vi.mock('@/features/authFiles/hooks/useAuthFilesPrefixProxyEditor', () => ({
     openPrefixProxyEditor: mocks.openPrefixProxyEditor,
     closePrefixProxyEditor: mocks.closePrefixProxyEditor,
     handlePrefixProxyChange: mocks.handlePrefixProxyChange,
+    handlePrefixProxyTest: mocks.handlePrefixProxyTest,
     handlePrefixProxySave: mocks.handlePrefixProxySave,
   }),
 }));

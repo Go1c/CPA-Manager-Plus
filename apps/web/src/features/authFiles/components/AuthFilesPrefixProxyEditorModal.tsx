@@ -19,14 +19,24 @@ export type AuthFilesPrefixProxyEditorModalProps = {
   dirty: boolean;
   onClose: () => void;
   onCopyText: (text: string) => void | Promise<void>;
+  onTestProxy: () => void;
   onSave: () => void;
   onChange: (field: PrefixProxyEditorField, value: PrefixProxyEditorFieldValue) => void;
 };
 
 export function AuthFilesPrefixProxyEditorModal(props: AuthFilesPrefixProxyEditorModalProps) {
   const { t } = useTranslation();
-  const { disableControls, editor, updatedText, dirty, onClose, onCopyText, onSave, onChange } =
-    props;
+  const {
+    disableControls,
+    editor,
+    updatedText,
+    dirty,
+    onClose,
+    onCopyText,
+    onTestProxy,
+    onSave,
+    onChange,
+  } = props;
   const formatJsonText = (text: string) => {
     if (!text) return '';
     try {
@@ -64,6 +74,22 @@ export function AuthFilesPrefixProxyEditorModal(props: AuthFilesPrefixProxyEdito
           >
             {t('common.copy')}
           </Button>
+          {editor?.providerKey === 'codex' && (
+            <Button
+              variant="secondary"
+              onClick={onTestProxy}
+              loading={editor.testingProxy}
+              disabled={
+                disableControls ||
+                editor.loading ||
+                editor.saving ||
+                editor.testingProxy ||
+                !editor.json
+              }
+            >
+              {t('auth_files.proxy_test_button')}
+            </Button>
+          )}
           <Button
             onClick={onSave}
             loading={editor?.saving === true}

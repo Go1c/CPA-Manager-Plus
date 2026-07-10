@@ -4,6 +4,7 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     get: vi.fn(),
     getRaw: vi.fn(),
+    post: vi.fn(),
     postForm: vi.fn(),
     patch: vi.fn(),
   },
@@ -13,6 +14,7 @@ vi.mock('./client', () => ({
   apiClient: {
     get: mocks.get,
     getRaw: mocks.getRaw,
+    post: mocks.post,
     postForm: mocks.postForm,
     patch: mocks.patch,
   },
@@ -23,8 +25,35 @@ import { authFilesApi } from './authFiles';
 beforeEach(() => {
   mocks.get.mockReset();
   mocks.getRaw.mockReset();
+  mocks.post.mockReset();
   mocks.postForm.mockReset();
   mocks.patch.mockReset();
+});
+
+describe('authFilesApi proxy test', () => {
+  it('tests an unsaved proxy candidate through the management endpoint', async () => {
+    const response = {
+      ok: true,
+      code: 'proxy_test_ok',
+      cloudflare_pop: 'SIN',
+      timings_ms: { total: 120 },
+    };
+    mocks.post.mockResolvedValue(response);
+
+    await expect(
+      authFilesApi.testProxy(
+        'socks5://user:password@proxy.example.com:443',
+        'codex',
+        'codex-example.json'
+      )
+    ).resolves.toEqual(response);
+
+    expect(mocks.post).toHaveBeenCalledWith('/proxy/test', {
+      proxy_url: 'socks5://user:password@proxy.example.com:443',
+      provider: 'codex',
+      auth_file: 'codex-example.json',
+    });
+  });
 });
 
 describe('authFilesApi OAuth model alias normalization', () => {

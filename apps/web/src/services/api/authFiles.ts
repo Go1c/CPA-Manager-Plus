@@ -673,6 +673,13 @@ export const authFilesApi = {
       fields,
     }),
 
+  testProxy: (proxyUrl: string, provider: string, authFile: string) =>
+    apiClient.post<ProxyTestResult>('/proxy/test', {
+      proxy_url: proxyUrl,
+      provider,
+      auth_file: authFile,
+    }),
+
   patchFieldsForAuthIndexes: async (
     name: string,
     authIndexes: AuthFilePatchAuthIndex[],

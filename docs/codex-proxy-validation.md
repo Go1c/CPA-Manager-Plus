@@ -13,6 +13,8 @@ CPA Manager requires a server-side CLIProxyAPI proxy test before it saves a chan
 
 The UI disables duplicate save actions while the test is running, retains the candidate input after failure, and displays the failure stage, proxy-connect time, TLS-handshake time, first-byte time, total time, and Cloudflare exit POP. The advanced raw URL field remains available, but the structured fields are preferred.
 
+The Codex auth-file editor also provides a **Test proxy** button. It tests the current unsaved proxy fields without changing the auth file. Saving a changed proxy still runs the required server-side test again, so editing the candidate after a successful manual test cannot bypass validation.
+
 An empty proxy is accepted only when CLIProxyAPI allows direct Codex traffic. When CLIProxyAPI has `codex-proxy-required: true`, the server rejects an empty or direct candidate. Enabling a disabled Codex credential is also guarded by CLIProxyAPI's real proxy test.
 
 ## Manager API

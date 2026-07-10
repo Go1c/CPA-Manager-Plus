@@ -71,7 +71,8 @@ export async function handleDemoApiRequest<T = unknown>(
 
   if (pathname === '/config') return rawConfig as T;
   if (pathname === '/latest-version') return getDemoLatestVersion() as T;
-  if (pathname === '/config.yaml') return (typeof data === 'string' ? ok : getDemoConfigYaml()) as T;
+  if (pathname === '/config.yaml')
+    return (typeof data === 'string' ? ok : getDemoConfigYaml()) as T;
 
   const providerKey = providerEndpointKeys[pathname];
   if (providerKey) {
@@ -109,6 +110,21 @@ export async function handleDemoApiRequest<T = unknown>(
   }
   if (pathname === '/auth-files/status' || pathname === '/auth-files/fields') return ok as T;
   if (pathname.startsWith('/auth-files/')) return ok as T;
+  if (pathname === '/proxy/test') {
+    return {
+      ok: true,
+      code: 'proxy_test_ok',
+      proxy_mode: 'proxy',
+      target_status: 401,
+      cloudflare_pop: 'SIN',
+      timings_ms: {
+        proxy_connect: 42,
+        tls_handshake: 51,
+        first_byte: 130,
+        total: 131,
+      },
+    } as T;
+  }
 
   if (pathname === '/oauth-excluded-models') {
     if (method === 'get') return rawConfig['oauth-excluded-models'] as T;
@@ -143,10 +159,10 @@ export async function handleDemoApiRequest<T = unknown>(
   if (/^\/plugin-store\/[^/]+\/install$/.test(pathname)) {
     const requestedVersion =
       params.get('version') ||
-      ((data && typeof data === 'object' && 'version' in data
+      (data && typeof data === 'object' && 'version' in data
         ? String((data as { version?: unknown }).version ?? '')
         : ''
-      ).trim());
+      ).trim();
     return {
       status: 'installed',
       source_id: params.get('source') || 'official',
