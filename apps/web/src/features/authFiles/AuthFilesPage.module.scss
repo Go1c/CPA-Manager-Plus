@@ -1639,6 +1639,37 @@
   font-size: 12px;
 }
 
+.proxyTestStatus {
+  display: flex;
+  align-items: center;
+  gap: $spacing-sm;
+  padding: $spacing-sm $spacing-md;
+  border-radius: $radius-md;
+  border: 1px solid var(--primary-color);
+  background: color-mix(in srgb, var(--primary-color) 10%, transparent);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.proxyTestResult {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  padding: $spacing-sm $spacing-md;
+  border-radius: $radius-md;
+  font-size: 12px;
+}
+
+.proxyTestSuccess {
+  border: 1px solid var(--success-color);
+  background: color-mix(in srgb, var(--success-color) 10%, transparent);
+}
+
+.proxyTestFailure {
+  border: 1px solid var(--danger-color);
+  background: rgba($error-color, 0.1);
+}
+
 .prefixProxyJsonWrapper {
   display: flex;
   flex-direction: column;
@@ -1694,6 +1725,16 @@
 
   :global(.form-group) {
     margin: 0;
+  }
+}
+
+.proxyStructuredFields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: $spacing-sm;
+
+  @include mobile {
+    grid-template-columns: 1fr;
   }
 }
 

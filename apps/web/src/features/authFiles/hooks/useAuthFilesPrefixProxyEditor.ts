@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { authFilesApi, type AuthFileFieldsPatch } from '@/services/api';
+import { authFilesApi, type AuthFileFieldsPatch, type ProxyTestResult } from '@/services/api';
 import type { AuthFileItem } from '@/types';
 import { useNotificationStore } from '@/stores';
 import {
@@ -17,12 +17,16 @@ type AuthFileHeadersErrorKey =
   | 'auth_files.headers_invalid_object'
   | 'auth_files.headers_invalid_value';
 type AuthFileContentErrorKey =
-  | 'auth_files.prefix_proxy_invalid_json'
-  | 'auth_files.prefix_proxy_html_challenge';
+  'auth_files.prefix_proxy_invalid_json' | 'auth_files.prefix_proxy_html_challenge';
 
 export type PrefixProxyEditorField =
   | 'prefix'
   | 'proxyUrl'
+  | 'proxyScheme'
+  | 'proxyHost'
+  | 'proxyPort'
+  | 'proxyUsername'
+  | 'proxyPassword'
   | 'priority'
   | 'websockets'
   | 'note'
@@ -35,6 +39,7 @@ export type PrefixProxyEditorState = {
   fileInfoText: string;
   loading: boolean;
   saving: boolean;
+  testingProxy: boolean;
   error: string | null;
   originalText: string;
   rawText: string;
@@ -43,6 +48,13 @@ export type PrefixProxyEditorState = {
   providerKey: string;
   prefix: string;
   proxyUrl: string;
+  proxyScheme: string;
+  proxyHost: string;
+  proxyPort: string;
+  proxyUsername: string;
+  proxyPassword: string;
+  proxyStructuredTouched: boolean;
+  proxyTestResult: ProxyTestResult | null;
   priority: string;
   websockets: boolean;
   websocketsTouched: boolean;
@@ -108,6 +120,75 @@ const parseHeadersText = (
 
 const normalizeTextField = (value: unknown): string =>
   typeof value === 'string' ? value.trim() : '';
+
+type StructuredProxyFields = Pick<
+  PrefixProxyEditorState,
+  'proxyScheme' | 'proxyHost' | 'proxyPort' | 'proxyUsername' | 'proxyPassword'
+>;
+
+const emptyStructuredProxy = (): StructuredProxyFields => ({
+  proxyScheme: 'socks5',
+  proxyHost: '',
+  proxyPort: '',
+  proxyUsername: '',
+  proxyPassword: '',
+});
+
+const safeDecodeURIComponent = (value: string): string => {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+};
+
+export const parseStructuredProxy = (raw: string): StructuredProxyFields => {
+  const trimmed = raw.trim();
+  if (!trimmed) return emptyStructuredProxy();
+  try {
+    const parsed = new URL(trimmed);
+    const scheme = parsed.protocol.replace(/:$/, '').toLowerCase();
+    if (!['socks5', 'socks5h', 'http', 'https'].includes(scheme)) {
+      return emptyStructuredProxy();
+    }
+    return {
+      proxyScheme: scheme,
+      proxyHost: parsed.hostname.replace(/^\[|\]$/g, ''),
+      proxyPort: parsed.port,
+      proxyUsername: safeDecodeURIComponent(parsed.username),
+      proxyPassword: safeDecodeURIComponent(parsed.password),
+    };
+  } catch {
+    return emptyStructuredProxy();
+  }
+};
+
+export const buildStructuredProxyURL = (editor: PrefixProxyEditorState): string => {
+  if (!editor.proxyStructuredTouched) return editor.proxyUrl.trim();
+  const host = editor.proxyHost.trim();
+  const port = editor.proxyPort.trim();
+  const username = editor.proxyUsername;
+  const password = editor.proxyPassword;
+  if (!host && !port && !username && !password) return '';
+  if (!host || !port) {
+    throw new Error('Proxy host and port are required');
+  }
+  const scheme = editor.proxyScheme.trim().toLowerCase() || 'socks5';
+  const formattedHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  const userInfo =
+    username || password ? `${encodeURIComponent(username)}:${encodeURIComponent(password)}@` : '';
+  return `${scheme}://${userInfo}${formattedHost}:${port}`;
+};
+
+const extractProxyTestResult = (error: unknown): ProxyTestResult | null => {
+  if (!error || typeof error !== 'object' || !('response' in error)) return null;
+  const response = (error as { response?: { data?: unknown } }).response;
+  const data = response?.data;
+  if (!data || typeof data !== 'object') return null;
+  const record = data as Record<string, unknown>;
+  if (typeof record.code !== 'string') return null;
+  return record as unknown as ProxyTestResult;
+};
 
 const INVALID_CONTENT_PREVIEW_LIMIT = 1000;
 
@@ -227,7 +308,7 @@ const buildAuthFileFieldsPatch = (
   }
 
   const originalProxyURL = normalizeTextField(original.proxy_url);
-  const nextProxyURL = editor.proxyUrl.trim();
+  const nextProxyURL = buildStructuredProxyURL(editor);
   if (nextProxyURL !== originalProxyURL) {
     patch.proxy_url = nextProxyURL;
   }
@@ -372,6 +453,7 @@ export function useAuthFilesPrefixProxyEditor(
       fileInfoText: JSON.stringify(file, null, 2),
       loading: true,
       saving: false,
+      testingProxy: false,
       error: null,
       originalText: '',
       rawText: '',
@@ -380,6 +462,9 @@ export function useAuthFilesPrefixProxyEditor(
       providerKey: fileProviderKey,
       prefix: '',
       proxyUrl: '',
+      ...emptyStructuredProxy(),
+      proxyStructuredTouched: false,
+      proxyTestResult: null,
       priority: '',
       websockets: false,
       websocketsTouched: false,
@@ -423,6 +508,7 @@ export function useAuthFilesPrefixProxyEditor(
       const originalText = JSON.stringify(json);
       const prefix = typeof json.prefix === 'string' ? json.prefix : '';
       const proxyUrl = typeof json.proxy_url === 'string' ? json.proxy_url : '';
+      const structuredProxy = parseStructuredProxy(proxyUrl);
       const priority = parsePriorityValue(json.priority);
       const providerKey = normalizeProviderKey(
         String(json.type ?? json.provider ?? file.type ?? file.provider ?? '')
@@ -452,6 +538,9 @@ export function useAuthFilesPrefixProxyEditor(
           providerKey,
           prefix,
           proxyUrl,
+          ...structuredProxy,
+          proxyStructuredTouched: false,
+          proxyTestResult: null,
           priority: priority !== undefined ? String(priority) : '',
           websockets,
           websocketsTouched: false,
@@ -480,7 +569,56 @@ export function useAuthFilesPrefixProxyEditor(
     setPrefixProxyEditor((prev) => {
       if (!prev) return prev;
       if (field === 'prefix') return { ...prev, prefix: String(value) };
-      if (field === 'proxyUrl') return { ...prev, proxyUrl: String(value) };
+      if (field === 'proxyUrl') {
+        const proxyUrl = String(value);
+        return {
+          ...prev,
+          proxyUrl,
+          ...parseStructuredProxy(proxyUrl),
+          proxyStructuredTouched: false,
+          proxyTestResult: null,
+        };
+      }
+      if (field === 'proxyScheme') {
+        return {
+          ...prev,
+          proxyScheme: String(value),
+          proxyStructuredTouched: true,
+          proxyTestResult: null,
+        };
+      }
+      if (field === 'proxyHost') {
+        return {
+          ...prev,
+          proxyHost: String(value),
+          proxyStructuredTouched: true,
+          proxyTestResult: null,
+        };
+      }
+      if (field === 'proxyPort') {
+        return {
+          ...prev,
+          proxyPort: String(value),
+          proxyStructuredTouched: true,
+          proxyTestResult: null,
+        };
+      }
+      if (field === 'proxyUsername') {
+        return {
+          ...prev,
+          proxyUsername: String(value),
+          proxyStructuredTouched: true,
+          proxyTestResult: null,
+        };
+      }
+      if (field === 'proxyPassword') {
+        return {
+          ...prev,
+          proxyPassword: String(value),
+          proxyStructuredTouched: true,
+          proxyTestResult: null,
+        };
+      }
       if (field === 'priority') return { ...prev, priority: String(value) };
       if (field === 'websockets') {
         return { ...prev, websockets: Boolean(value), websocketsTouched: true };
@@ -514,23 +652,68 @@ export function useAuthFilesPrefixProxyEditor(
       return;
     }
     if (!hasKeys(payload)) return;
+    const shouldTestProxy =
+      prefixProxyEditor.providerKey === 'codex' && payload.proxy_url !== undefined;
+    const nextText = prefixProxyUpdatedText;
 
     setPrefixProxyEditor((prev) => {
       if (!prev || prev.fileName !== name) return prev;
-      return { ...prev, saving: true };
+      return {
+        ...prev,
+        saving: true,
+        testingProxy: shouldTestProxy,
+        proxyTestResult: shouldTestProxy ? null : prev.proxyTestResult,
+        error: null,
+      };
     });
 
     try {
+      if (shouldTestProxy) {
+        const response = await authFilesApi.saveProxyFields(
+          name,
+          prefixProxyEditor.providerKey,
+          payload
+        );
+        const nextJSON = JSON.parse(nextText) as Record<string, unknown>;
+        const nextProxyURL = typeof nextJSON.proxy_url === 'string' ? nextJSON.proxy_url : '';
+        setPrefixProxyEditor((prev) => {
+          if (!prev || prev.fileName !== name) return prev;
+          return {
+            ...prev,
+            saving: false,
+            testingProxy: false,
+            proxyTestResult: response.proxy_test,
+            json: nextJSON,
+            originalText: nextText,
+            rawText: nextText,
+            proxyUrl: nextProxyURL,
+            ...parseStructuredProxy(nextProxyURL),
+            proxyStructuredTouched: false,
+            error: null,
+          };
+        });
+        showNotification(t('auth_files.prefix_proxy_saved_success', { name }), 'success');
+        await loadFiles();
+        return;
+      }
+
       await authFilesApi.patchFields(name, payload);
       showNotification(t('auth_files.prefix_proxy_saved_success', { name }), 'success');
       await loadFiles();
       setPrefixProxyEditor(null);
     } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : '';
+      const proxyTestResult = extractProxyTestResult(err);
+      const errorMessage = proxyTestResult?.message ?? (err instanceof Error ? err.message : '');
       showNotification(`${t('notification.update_failed')}: ${errorMessage}`, 'error');
       setPrefixProxyEditor((prev) => {
         if (!prev || prev.fileName !== name) return prev;
-        return { ...prev, saving: false };
+        return {
+          ...prev,
+          saving: false,
+          testingProxy: false,
+          proxyTestResult,
+          error: errorMessage || prev.error,
+        };
       });
     }
   };

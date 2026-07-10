@@ -38,6 +38,7 @@ var cpaBuiltinManagementPathHeads = map[string]struct{}{
 	"monitoring":                {},
 	"plugin-store":              {},
 	"plugins":                   {},
+	"proxy":                     {},
 	"reload":                    {},
 	"usage":                     {},
 	"usage-statistics-enabled":  {},

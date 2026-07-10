@@ -20,6 +20,28 @@ export type AuthFileFieldsPatch = {
   priority?: number;
   note?: string;
 };
+export type ProxyTestTimings = {
+  proxy_connect?: number;
+  tls_handshake?: number;
+  first_byte?: number;
+  total?: number;
+};
+export type ProxyTestResult = {
+  ok: boolean;
+  code: string;
+  stage?: string;
+  message?: string;
+  proxy?: string;
+  proxy_hash?: string;
+  proxy_mode?: string;
+  target_status?: number;
+  cloudflare_pop?: string;
+  timings_ms?: ProxyTestTimings;
+};
+export type AuthProxySaveResponse = {
+  status: string;
+  proxy_test: ProxyTestResult;
+};
 export type AuthFilePatchAuthIndex = string | number;
 type AuthFileBatchFailure = { name: string; error: string };
 type AuthFileBatchUploadResponse = {
@@ -643,6 +665,13 @@ export const authFilesApi = {
 
   patchFields: (name: string, fields: AuthFileFieldsPatch) =>
     apiClient.patch('/auth-files/fields', { name, ...fields }),
+
+  saveProxyFields: (name: string, provider: string, fields: AuthFileFieldsPatch) =>
+    apiClient.post<AuthProxySaveResponse>('/auth-files/proxy-save', {
+      name,
+      provider,
+      fields,
+    }),
 
   patchFieldsForAuthIndexes: async (
     name: string,

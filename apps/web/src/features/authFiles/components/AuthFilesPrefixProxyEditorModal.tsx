@@ -90,6 +90,61 @@ export function AuthFilesPrefixProxyEditorModal(props: AuthFilesPrefixProxyEdito
           ) : (
             <>
               {editor.error && <div className={styles.prefixProxyError}>{editor.error}</div>}
+              {editor.testingProxy && (
+                <div className={styles.proxyTestStatus}>
+                  <LoadingSpinner size={14} />
+                  <span>{t('auth_files.proxy_testing')}</span>
+                </div>
+              )}
+              {editor.proxyTestResult && (
+                <div
+                  className={`${styles.proxyTestResult} ${
+                    editor.proxyTestResult.ok ? styles.proxyTestSuccess : styles.proxyTestFailure
+                  }`}
+                >
+                  <strong>
+                    {editor.proxyTestResult.ok
+                      ? t('auth_files.proxy_test_success')
+                      : t('auth_files.proxy_test_failed')}
+                  </strong>
+                  <span>{editor.proxyTestResult.code}</span>
+                  {editor.proxyTestResult.stage && (
+                    <span>
+                      {t('auth_files.proxy_test_stage')}: {editor.proxyTestResult.stage}
+                    </span>
+                  )}
+                  {editor.proxyTestResult.cloudflare_pop && (
+                    <span>
+                      {t('auth_files.proxy_test_pop')}: {editor.proxyTestResult.cloudflare_pop}
+                    </span>
+                  )}
+                  {editor.proxyTestResult.timings_ms?.proxy_connect !== undefined && (
+                    <span>
+                      {t('auth_files.proxy_test_proxy_connect')}:{' '}
+                      {editor.proxyTestResult.timings_ms.proxy_connect} ms
+                    </span>
+                  )}
+                  {editor.proxyTestResult.timings_ms?.tls_handshake !== undefined && (
+                    <span>
+                      {t('auth_files.proxy_test_tls_handshake')}:{' '}
+                      {editor.proxyTestResult.timings_ms.tls_handshake} ms
+                    </span>
+                  )}
+                  {editor.proxyTestResult.timings_ms?.first_byte !== undefined && (
+                    <span>
+                      {t('auth_files.proxy_test_first_byte')}:{' '}
+                      {editor.proxyTestResult.timings_ms.first_byte} ms
+                    </span>
+                  )}
+                  {editor.proxyTestResult.timings_ms?.total !== undefined && (
+                    <span>
+                      {t('auth_files.proxy_test_total')}: {editor.proxyTestResult.timings_ms.total}{' '}
+                      ms
+                    </span>
+                  )}
+                  {editor.proxyTestResult.message && <span>{editor.proxyTestResult.message}</span>}
+                </div>
+              )}
               <div className={styles.prefixProxyJsonWrapper}>
                 <label className={styles.prefixProxyLabel}>
                   {t('auth_files.prefix_proxy_info_label')}
@@ -128,10 +183,65 @@ export function AuthFilesPrefixProxyEditorModal(props: AuthFilesPrefixProxyEdito
                     disabled={disableControls || editor.saving || !editor.json}
                     onChange={(e) => onChange('prefix', e.target.value)}
                   />
+                  {editor.providerKey === 'codex' && (
+                    <div className={styles.proxyStructuredFields}>
+                      <div className="form-group">
+                        <label>{t('auth_files.proxy_scheme_label')}</label>
+                        <select
+                          className="input"
+                          value={editor.proxyScheme}
+                          disabled={disableControls || editor.saving || !editor.json}
+                          onChange={(e) => onChange('proxyScheme', e.target.value)}
+                        >
+                          <option value="socks5">socks5</option>
+                          <option value="socks5h">socks5h</option>
+                          <option value="http">http</option>
+                          <option value="https">https</option>
+                        </select>
+                      </div>
+                      <Input
+                        label={t('auth_files.proxy_host_label')}
+                        value={editor.proxyHost}
+                        disabled={disableControls || editor.saving || !editor.json}
+                        onChange={(e) => onChange('proxyHost', e.target.value)}
+                      />
+                      <Input
+                        label={t('auth_files.proxy_port_label')}
+                        value={editor.proxyPort}
+                        inputMode="numeric"
+                        disabled={disableControls || editor.saving || !editor.json}
+                        onChange={(e) => onChange('proxyPort', e.target.value)}
+                      />
+                      <Input
+                        label={t('auth_files.proxy_username_label')}
+                        value={editor.proxyUsername}
+                        autoComplete="off"
+                        disabled={disableControls || editor.saving || !editor.json}
+                        onChange={(e) => onChange('proxyUsername', e.target.value)}
+                      />
+                      <Input
+                        label={t('auth_files.proxy_password_label')}
+                        type="password"
+                        value={editor.proxyPassword}
+                        autoComplete="new-password"
+                        disabled={disableControls || editor.saving || !editor.json}
+                        onChange={(e) => onChange('proxyPassword', e.target.value)}
+                      />
+                    </div>
+                  )}
                   <Input
-                    label={t('auth_files.proxy_url_label')}
+                    label={
+                      editor.providerKey === 'codex'
+                        ? t('auth_files.proxy_url_advanced_label')
+                        : t('auth_files.proxy_url_label')
+                    }
                     value={editor.proxyUrl}
                     placeholder={t('auth_files.proxy_url_placeholder')}
+                    hint={
+                      editor.providerKey === 'codex'
+                        ? t('auth_files.proxy_structured_hint')
+                        : undefined
+                    }
                     disabled={disableControls || editor.saving || !editor.json}
                     onChange={(e) => onChange('proxyUrl', e.target.value)}
                   />
