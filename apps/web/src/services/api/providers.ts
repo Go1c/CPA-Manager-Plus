@@ -56,6 +56,9 @@ const CLAUDE_KEY_FIELDS = [
   'experimental-cch-signing',
   'experimentalCchSigning',
   'experimental_cch_signing',
+  'rebuild-mid-system-message',
+  'rebuildMidSystemMessage',
+  'rebuild_mid_system_message',
 ] as const;
 const GEMINI_KEY_FIELDS = COOLING_PROVIDER_KEY_FIELDS;
 const VERTEX_KEY_FIELDS = COMMON_PROVIDER_KEY_FIELDS;
@@ -97,6 +100,15 @@ const MODEL_ALIAS_FIELDS = [
   'testModel',
   'test_model',
   'image',
+  'force-mapping',
+  'forceMapping',
+  'force_mapping',
+  'input-modalities',
+  'inputModalities',
+  'input_modalities',
+  'output-modalities',
+  'outputModalities',
+  'output_modalities',
   'thinking',
 ] as const;
 
@@ -126,6 +138,11 @@ const CLOAK_FIELDS = [
 
 const RAW_SECTION_ALIASES: Record<string, readonly string[]> = {
   'gemini-api-key': ['gemini-api-key', 'geminiApiKey', 'geminiApiKeys'],
+  'interactions-api-key': [
+    'interactions-api-key',
+    'interactionsApiKey',
+    'interactionsApiKeys',
+  ],
   'codex-api-key': ['codex-api-key', 'codexApiKey', 'codexApiKeys'],
   'claude-api-key': ['claude-api-key', 'claudeApiKey', 'claudeApiKeys'],
   'vertex-api-key': ['vertex-api-key', 'vertexApiKey', 'vertexApiKeys'],
@@ -270,6 +287,21 @@ const mergeModelPayloads = (raw: unknown, models: unknown) =>
           const rawModel = findRawRecord(rawRecords, usedIndexes, payload, index, modelIdentity);
           const next = mergeKnownFields(rawModel, payload, MODEL_ALIAS_FIELDS);
           preserveOmittedRawField(rawModel, payload, next, ['image']);
+          preserveOmittedRawField(rawModel, payload, next, [
+            'force-mapping',
+            'forceMapping',
+            'force_mapping',
+          ]);
+          preserveOmittedRawField(rawModel, payload, next, [
+            'input-modalities',
+            'inputModalities',
+            'input_modalities',
+          ]);
+          preserveOmittedRawField(rawModel, payload, next, [
+            'output-modalities',
+            'outputModalities',
+            'output_modalities',
+          ]);
           preserveOmittedRawField(rawModel, payload, next, ['thinking']);
           return next;
         });
@@ -358,6 +390,52 @@ const extractArrayPayload = (data: unknown, key: string): unknown[] => {
   return Array.isArray(candidate) ? candidate : [];
 };
 
+const getOpenAIProviderKey = (provider: Pick<OpenAIProviderConfig, 'name' | 'baseUrl'>) =>
+  `${String(provider.name ?? '')
+    .trim()
+    .toLowerCase()}\u0000${String(provider.baseUrl ?? '')
+    .trim()
+    .toLowerCase()}`;
+
+// CPA upstream currently omits some OpenAI provider fields from GET /openai-compatibility,
+// so we rehydrate them from /config when they are missing.
+// This is a temporary workaround until upstream fixes the issue.
+const hydrateOpenAIProvidersDisableCooling = async (providers: OpenAIProviderConfig[]) => {
+  if (!providers.some((provider) => provider.disableCooling === undefined)) {
+    return providers;
+  }
+
+  let rawConfig: unknown;
+  try {
+    rawConfig = await apiClient.get('/config');
+  } catch {
+    return providers;
+  }
+
+  const fallbackProviders = extractArrayPayload(rawConfig, 'openai-compatibility')
+    .map((item) => normalizeOpenAIProvider(item))
+    .filter(Boolean) as OpenAIProviderConfig[];
+
+  if (!fallbackProviders.length) {
+    return providers;
+  }
+
+  const fallbackByKey = new Map(
+    fallbackProviders.map((provider) => [getOpenAIProviderKey(provider), provider])
+  );
+
+  return providers.map((provider) => {
+    if (provider.disableCooling !== undefined) {
+      return provider;
+    }
+    const fallback = fallbackByKey.get(getOpenAIProviderKey(provider));
+    if (!fallback || fallback.disableCooling === undefined) {
+      return provider;
+    }
+    return { ...provider, disableCooling: fallback.disableCooling };
+  });
+};
+
 const buildProviderDeleteQuery = (apiKey: string, baseUrl?: string) => {
   const params = new URLSearchParams();
   params.set('api-key', apiKey.trim());
@@ -382,6 +460,15 @@ const serializeModelAliases = (models?: ModelAlias[]) =>
           }
           if (model.image !== undefined) {
             payload.image = model.image;
+          }
+          if (model.forceMapping !== undefined) {
+            payload['force-mapping'] = model.forceMapping;
+          }
+          if (model.inputModalities !== undefined) {
+            payload['input-modalities'] = model.inputModalities;
+          }
+          if (model.outputModalities !== undefined) {
+            payload['output-modalities'] = model.outputModalities;
           }
           if (isRecord(model.thinking)) {
             payload.thinking = model.thinking;
@@ -421,6 +508,9 @@ const serializeProviderKey = (config: ProviderKeyConfig) => {
   if (config.disableCooling !== undefined) payload['disable-cooling'] = config.disableCooling;
   if (config.experimentalCchSigning !== undefined) {
     payload['experimental-cch-signing'] = config.experimentalCchSigning;
+  }
+  if (config.rebuildMidSystemMessage !== undefined) {
+    payload['rebuild-mid-system-message'] = config.rebuildMidSystemMessage;
   }
   if (config.proxyUrl) payload['proxy-url'] = config.proxyUrl;
   const headers = serializeHeaders(config.headers);
@@ -484,9 +574,10 @@ const serializeVertexKey = (config: ProviderKeyConfig) => {
 const serializeGeminiKey = (config: GeminiKeyConfig) => {
   const payload: Record<string, unknown> = {};
   const apiKey = config.apiKey?.trim();
-  if (apiKey) payload['api-key'] = apiKey;
-  const authIndex = serializeAuthIndex(config.authIndex);
-  if (authIndex) payload['auth-index'] = authIndex;
+  if (!apiKey) {
+    throw new Error('API key is required for Gemini and Interactions providers');
+  }
+  payload['api-key'] = apiKey;
   if (config.priority !== undefined) payload.priority = config.priority;
   if (config.prefix?.trim()) payload.prefix = config.prefix.trim();
   if (config.baseUrl) payload['base-url'] = config.baseUrl;
@@ -548,6 +639,30 @@ export const providersApi = {
 
   deleteGeminiKey: (apiKey: string, baseUrl?: string) =>
     apiClient.delete(`/gemini-api-key${buildProviderDeleteQuery(apiKey, baseUrl)}`),
+
+  async getInteractionsKeys(): Promise<GeminiKeyConfig[]> {
+    const data = await apiClient.get('/interactions-api-key');
+    const list = extractArrayPayload(data, 'interactions-api-key');
+    return list.map((item) => normalizeGeminiKeyConfig(item)).filter(Boolean) as GeminiKeyConfig[];
+  },
+
+  saveInteractionsKeys: async (configs: GeminiKeyConfig[]) =>
+    apiClient.put(
+      '/interactions-api-key',
+      await buildPreservedList(
+        'interactions-api-key',
+        configs,
+        serializeGeminiKey,
+        (raw, payload) => mergeProviderKeyPayload(raw, payload, GEMINI_KEY_FIELDS),
+        providerKeyIdentity
+      )
+    ),
+
+  updateInteractionsKey: (index: number, value: GeminiKeyConfig) =>
+    apiClient.patch('/interactions-api-key', { index, value: serializeGeminiKey(value) }),
+
+  deleteInteractionsKey: (apiKey: string, baseUrl?: string) =>
+    apiClient.delete(`/interactions-api-key${buildProviderDeleteQuery(apiKey, baseUrl)}`),
 
   async getCodexConfigs(): Promise<ProviderKeyConfig[]> {
     const data = await apiClient.get('/codex-api-key');
@@ -630,9 +745,10 @@ export const providersApi = {
   async getOpenAIProviders(): Promise<OpenAIProviderConfig[]> {
     const data = await apiClient.get('/openai-compatibility');
     const list = extractArrayPayload(data, 'openai-compatibility');
-    return list
+    const providers = list
       .map((item) => normalizeOpenAIProvider(item))
       .filter(Boolean) as OpenAIProviderConfig[];
+    return hydrateOpenAIProvidersDisableCooling(providers);
   },
 
   saveOpenAIProviders: async (providers: OpenAIProviderConfig[]) =>

@@ -74,15 +74,15 @@ const getErrorMessage = (err: unknown) => {
   return '';
 };
 
-const normalizeClaudeModelEntries = (entries: Array<{ name: string; alias: string }>) =>
-  (entries ?? []).reduce<Array<{ name: string; alias: string }>>((acc, entry) => {
+const normalizeClaudeModelEntries = (entries: ProviderFormState['modelEntries']) =>
+  (entries ?? []).reduce<ProviderFormState['modelEntries']>((acc, entry) => {
     const name = String(entry?.name ?? '').trim();
     let alias = String(entry?.alias ?? '').trim();
     if (name) {
       alias = alias || name;
     }
     if (!name && !alias) return acc;
-    acc.push({ name, alias });
+    acc.push({ ...entry, name, alias });
     return acc;
   }, []);
 
@@ -113,6 +113,8 @@ const buildClaudeBaseline = (form: ProviderFormState): ClaudeEditBaseline => ({
   prefix: String(form.prefix ?? '').trim(),
   baseUrl: String(form.baseUrl ?? '').trim(),
   proxyUrl: String(form.proxyUrl ?? '').trim(),
+  disableCooling: Boolean(form.disableCooling),
+  rebuildMidSystemMessage: Boolean(form.rebuildMidSystemMessage),
   headers: normalizeHeaderEntries(form.headers),
   models: normalizeClaudeModelEntries(form.modelEntries),
   excludedModels: parseExcludedModels(form.excludedText ?? ''),
@@ -331,6 +333,8 @@ export function AiProvidersClaudeEditLayout() {
       baseline.prefix !== String(form.prefix ?? '').trim() ||
       baseline.baseUrl !== String(form.baseUrl ?? '').trim() ||
       baseline.proxyUrl !== String(form.proxyUrl ?? '').trim() ||
+      baseline.disableCooling !== Boolean(form.disableCooling) ||
+      baseline.rebuildMidSystemMessage !== Boolean(form.rebuildMidSystemMessage) ||
       isHeadersDirty ||
       isModelsDirty ||
       isExcludedModelsDirty ||
@@ -442,6 +446,7 @@ export function AiProvidersClaudeEditLayout() {
         authIndex: normalizeAuthIndex(form.authIndex) ?? undefined,
         disableCooling: form.disableCooling,
         experimentalCchSigning: form.experimentalCchSigning,
+        rebuildMidSystemMessage: form.rebuildMidSystemMessage,
       };
 
       const nextList =

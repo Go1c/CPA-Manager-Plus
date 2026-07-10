@@ -7,6 +7,7 @@ import { HeaderInputList } from '@/components/ui/HeaderInputList';
 import { ModelInputList } from '@/components/ui/ModelInputList';
 import { Modal } from '@/components/ui/Modal';
 import { SelectionCheckbox } from '@/components/ui/SelectionCheckbox';
+import { ToggleSwitch } from '@/components/ui/ToggleSwitch';
 import { modelsApi, providersApi } from '@/services/api';
 import { useConfigStore, useNotificationStore } from '@/stores';
 import type { GeminiKeyConfig } from '@/types';
@@ -29,6 +30,7 @@ interface GeminiEditDrawerProps {
   disabled: boolean;
   onClose: () => void;
   onSaved: () => void;
+  providerKind?: 'gemini' | 'interactions';
 }
 
 type GeminiFormBaseline = ReturnType<typeof buildGeminiBaseline>;
@@ -70,6 +72,7 @@ const buildGeminiBaseline = (form: GeminiFormState) => ({
   prefix: String(form.prefix ?? '').trim(),
   baseUrl: String(form.baseUrl ?? '').trim(),
   proxyUrl: String(form.proxyUrl ?? '').trim(),
+  disableCooling: Boolean(form.disableCooling),
   headers: normalizeHeaderEntries(form.headers),
   models: normalizeModelEntries(form.modelEntries),
   excludedModels: parseExcludedModels(form.excludedText ?? ''),
@@ -87,6 +90,7 @@ export function GeminiEditDrawer({
   disabled,
   onClose,
   onSaved,
+  providerKind = 'gemini',
 }: GeminiEditDrawerProps) {
   const { t } = useTranslation();
   const { showNotification } = useNotificationStore();
@@ -117,10 +121,19 @@ export function GeminiEditDrawer({
   }, [configs, editIndex]);
   const invalidIndex = editIndex !== null && !initialData;
 
-  const title =
-    editIndex !== null
-      ? t('ai_providers.gemini_edit_modal_title')
-      : t('ai_providers.gemini_add_modal_title');
+  const isInteractions = providerKind === 'interactions';
+  const configSection = isInteractions ? 'interactions-api-key' : 'gemini-api-key';
+  const title = isInteractions
+    ? t(
+        editIndex !== null
+          ? 'ai_providers.interactions_edit_modal_title'
+          : 'ai_providers.interactions_add_modal_title'
+      )
+    : t(
+        editIndex !== null
+          ? 'ai_providers.gemini_edit_modal_title'
+          : 'ai_providers.gemini_add_modal_title'
+      );
 
   // Load configs on open
   useEffect(() => {
@@ -128,7 +141,7 @@ export function GeminiEditDrawer({
     let cancelled = false;
     setLoading(true);
     setError('');
-    fetchConfig('gemini-api-key')
+    fetchConfig(configSection)
       .then((value) => {
         if (cancelled) return;
         setConfigs(Array.isArray(value) ? (value as GeminiKeyConfig[]) : []);
@@ -145,7 +158,7 @@ export function GeminiEditDrawer({
     return () => {
       cancelled = true;
     };
-  }, [open, fetchConfig, t]);
+  }, [configSection, open, fetchConfig, t]);
 
   // Init form when configs loaded
   useEffect(() => {
@@ -184,6 +197,7 @@ export function GeminiEditDrawer({
       baseline.prefix !== String(form.prefix ?? '').trim() ||
       baseline.baseUrl !== String(form.baseUrl ?? '').trim() ||
       baseline.proxyUrl !== String(form.proxyUrl ?? '').trim() ||
+      baseline.disableCooling !== Boolean(form.disableCooling) ||
       !areKeyValueEntriesEqual(baseline.headers, normalizeHeaderEntries(form.headers)) ||
       !areModelEntriesEqual(baseline.models, normalizeModelEntries(form.modelEntries)) ||
       !areStringArraysEqual(baseline.excludedModels, parseExcludedModels(form.excludedText ?? ''))
@@ -201,6 +215,31 @@ export function GeminiEditDrawer({
     });
   }, [discoveredModels, modelDiscoverySearch]);
 
+  const configuredModelNames = useMemo(
+    () =>
+      new Set(
+        form.modelEntries
+          .map((entry) => stripGeminiModelResourceName(entry.name).trim().toLowerCase())
+          .filter(Boolean)
+      ),
+    [form.modelEntries]
+  );
+
+  const visibleDiscoverableModelNames = useMemo(
+    () =>
+      discoveredModelsFiltered
+        .map((model) => stripGeminiModelResourceName(model.name).trim())
+        .filter((name) => name && !configuredModelNames.has(name.toLowerCase())),
+    [configuredModelNames, discoveredModelsFiltered]
+  );
+
+  const allVisibleSelected = useMemo(
+    () =>
+      visibleDiscoverableModelNames.length > 0 &&
+      visibleDiscoverableModelNames.every((name) => modelDiscoverySelected.has(name)),
+    [modelDiscoverySelected, visibleDiscoverableModelNames]
+  );
+
   const mergeDiscoveredModels = useCallback(
     (selectedModels: ModelInfo[]) => {
       if (!selectedModels.length) return;
@@ -210,12 +249,13 @@ export function GeminiEditDrawer({
         prev.modelEntries.forEach((entry) => {
           const name = stripGeminiModelResourceName(entry.name);
           if (!name) return;
-          mergedMap.set(name, { ...entry, name, alias: entry.alias?.trim() || '' });
+          mergedMap.set(name.toLowerCase(), { ...entry, name, alias: entry.alias?.trim() || '' });
         });
         selectedModels.forEach((model) => {
           const name = stripGeminiModelResourceName(model.name);
-          if (!name || mergedMap.has(name)) return;
-          mergedMap.set(name, { name, alias: model.alias ?? '' });
+          const key = name.toLowerCase();
+          if (!name || mergedMap.has(key)) return;
+          mergedMap.set(key, { name, alias: model.alias ?? '' });
           addedCount += 1;
         });
         const mergedEntries = Array.from(mergedMap.values());
@@ -259,9 +299,14 @@ export function GeminiEditDrawer({
   const handleSave = useCallback(async () => {
     if (!canSave) return;
     const apiKey = form.apiKey.trim();
-    if (!apiKey && !normalizeAuthIndex(form.authIndex)) {
+    if (!apiKey) {
       showNotification(
-        t('ai_providers.gemini_key_required', { defaultValue: 'Please enter a Gemini API Key' }),
+        t(
+          isInteractions
+            ? 'ai_providers.interactions_key_required'
+            : 'ai_providers.gemini_key_required',
+          { defaultValue: 'Please enter an API Key' }
+        ),
         'error'
       );
       return;
@@ -274,7 +319,7 @@ export function GeminiEditDrawer({
         name: stripGeminiModelResourceName(entry.name),
       }));
       const payload: GeminiKeyConfig = {
-        apiKey: form.apiKey.trim(),
+        apiKey,
         priority: form.priority !== undefined ? Math.trunc(form.priority) : undefined,
         prefix: form.prefix?.trim() || undefined,
         baseUrl: form.baseUrl?.trim() || undefined,
@@ -289,13 +334,25 @@ export function GeminiEditDrawer({
         editIndex !== null
           ? configs.map((item, idx) => (idx === editIndex ? payload : item))
           : [...configs, payload];
-      await providersApi.saveGeminiKeys(nextList);
-      updateConfigValue('gemini-api-key', nextList);
-      clearCache('gemini-api-key');
+      if (isInteractions) {
+        await providersApi.saveInteractionsKeys(nextList);
+      } else {
+        await providersApi.saveGeminiKeys(nextList);
+      }
+      updateConfigValue(configSection, nextList);
+      clearCache(configSection);
       showNotification(
         editIndex !== null
-          ? t('notification.gemini_key_updated')
-          : t('notification.gemini_key_added'),
+          ? t(
+              isInteractions
+                ? 'notification.interactions_key_updated'
+                : 'notification.gemini_key_updated'
+            )
+          : t(
+              isInteractions
+                ? 'notification.interactions_key_added'
+                : 'notification.gemini_key_added'
+            ),
         'success'
       );
       onSaved();
@@ -310,8 +367,10 @@ export function GeminiEditDrawer({
     canSave,
     clearCache,
     configs,
+    configSection,
     editIndex,
     form,
+    isInteractions,
     onClose,
     onSaved,
     showNotification,
@@ -335,14 +394,46 @@ export function GeminiEditDrawer({
     void fetchModelDiscovery();
   }, [modelDiscoveryOpen, fetchModelDiscovery]);
 
+  useEffect(() => {
+    const availableNames = new Set(
+      discoveredModels.map((model) => stripGeminiModelResourceName(model.name).trim())
+    );
+    setModelDiscoverySelected((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      prev.forEach((name) => {
+        if (availableNames.has(name) && !configuredModelNames.has(name.toLowerCase())) {
+          next.add(name);
+        } else {
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [configuredModelNames, discoveredModels]);
+
   const toggleModelDiscoverySelection = (name: string) => {
+    const normalizedName = stripGeminiModelResourceName(name).trim();
+    if (configuredModelNames.has(normalizedName.toLowerCase())) return;
     setModelDiscoverySelected((prev) => {
       const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
+      if (next.has(normalizedName)) next.delete(normalizedName);
+      else next.add(normalizedName);
       return next;
     });
   };
+
+  const handleSelectVisibleModels = useCallback(() => {
+    setModelDiscoverySelected((prev) => {
+      const next = new Set(prev);
+      visibleDiscoverableModelNames.forEach((name) => next.add(name));
+      return next;
+    });
+  }, [visibleDiscoverableModelNames]);
+
+  const handleClearModelDiscoverySelection = useCallback(() => {
+    setModelDiscoverySelected(new Set());
+  }, []);
 
   const canOpenModelDiscovery = !disabled && !saving && !loading && !invalidIndex;
   const canApplyModelDiscovery =
@@ -368,8 +459,16 @@ export function GeminiEditDrawer({
         {!loading && !invalidIndex && (
           <>
             <Input
-              label={t('ai_providers.gemini_add_modal_key_label')}
-              placeholder={t('ai_providers.gemini_add_modal_key_placeholder')}
+              label={t(
+                isInteractions
+                  ? 'ai_providers.interactions_key_label'
+                  : 'ai_providers.gemini_add_modal_key_label'
+              )}
+              placeholder={t(
+                isInteractions
+                  ? 'ai_providers.interactions_key_placeholder'
+                  : 'ai_providers.gemini_add_modal_key_placeholder'
+              )}
               value={form.apiKey}
               onChange={(e) => setForm((prev) => ({ ...prev, apiKey: e.target.value }))}
               disabled={disabled || saving}
@@ -423,6 +522,16 @@ export function GeminiEditDrawer({
               removeButtonAriaLabel={t('common.delete')}
               disabled={disabled || saving}
             />
+            <div className="form-group">
+              <label>{t('ai_providers.disable_cooling_label')}</label>
+              <ToggleSwitch
+                checked={Boolean(form.disableCooling)}
+                onChange={(value) => setForm((prev) => ({ ...prev, disableCooling: value }))}
+                disabled={disabled || saving}
+                ariaLabel={t('ai_providers.disable_cooling_label')}
+              />
+              <div className="hint">{t('ai_providers.disable_cooling_hint')}</div>
+            </div>
 
             <div className={styles.modelConfigSection}>
               <div className={styles.modelConfigHeader}>
@@ -502,7 +611,7 @@ export function GeminiEditDrawer({
                     size="sm"
                     onClick={() => {
                       const selectedModels = discoveredModels.filter((m) =>
-                        modelDiscoverySelected.has(m.name)
+                        modelDiscoverySelected.has(stripGeminiModelResourceName(m.name).trim())
                       );
                       mergeDiscoveredModels(selectedModels);
                       setModelDiscoveryOpen(false);
@@ -525,34 +634,91 @@ export function GeminiEditDrawer({
                   onChange={(e) => setModelDiscoverySearch(e.target.value)}
                   disabled={modelDiscoveryFetching}
                 />
+                {discoveredModels.length > 0 && (
+                  <div className={styles.modelDiscoveryToolbar}>
+                    <div className={styles.modelDiscoveryToolbarActions}>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={handleSelectVisibleModels}
+                        disabled={
+                          disabled ||
+                          saving ||
+                          modelDiscoveryFetching ||
+                          visibleDiscoverableModelNames.length === 0 ||
+                          allVisibleSelected
+                        }
+                      >
+                        {t('ai_providers.model_discovery_select_visible')}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={handleClearModelDiscoverySelection}
+                        disabled={
+                          disabled ||
+                          saving ||
+                          modelDiscoveryFetching ||
+                          modelDiscoverySelected.size === 0
+                        }
+                      >
+                        {t('ai_providers.model_discovery_clear_selection')}
+                      </Button>
+                    </div>
+                    <div className={styles.modelDiscoverySelectionSummary}>
+                      {t('ai_providers.model_discovery_selected_count', {
+                        count: modelDiscoverySelected.size,
+                      })}
+                    </div>
+                  </div>
+                )}
                 {modelDiscoveryError && <div className="error-box">{modelDiscoveryError}</div>}
                 {modelDiscoveryFetching ? (
                   <div className={styles.sectionHint}>
                     {t('ai_providers.gemini_models_fetch_loading')}
                   </div>
-                ) : discoveredModelsFiltered.length === 0 ? (
+                ) : discoveredModels.length === 0 ? (
                   <div className={styles.sectionHint}>
                     {t('ai_providers.gemini_models_fetch_empty')}
+                  </div>
+                ) : discoveredModelsFiltered.length === 0 ? (
+                  <div className={styles.sectionHint}>
+                    {t('ai_providers.gemini_models_search_empty')}
                   </div>
                 ) : (
                   <div className={styles.modelDiscoveryList}>
                     {discoveredModelsFiltered.map((model) => {
-                      const checked = modelDiscoverySelected.has(model.name);
+                      const normalizedName = stripGeminiModelResourceName(model.name).trim();
+                      const checked = modelDiscoverySelected.has(normalizedName);
+                      const alreadyConfigured = configuredModelNames.has(
+                        normalizedName.toLowerCase()
+                      );
                       return (
                         <SelectionCheckbox
                           key={model.name}
                           checked={checked}
                           onChange={() => toggleModelDiscoverySelection(model.name)}
-                          disabled={disabled || saving || modelDiscoveryFetching}
+                          disabled={
+                            disabled || saving || modelDiscoveryFetching || alreadyConfigured
+                          }
                           ariaLabel={model.name}
                           className={`${styles.modelDiscoveryRow} ${checked ? styles.modelDiscoveryRowSelected : ''}`}
                           labelClassName={styles.modelDiscoverySelectionLabel}
                           label={
                             <div className={styles.modelDiscoveryMeta}>
                               <div className={styles.modelDiscoveryName}>
-                                {model.name}
-                                {model.alias && (
-                                  <span className={styles.modelDiscoveryAlias}>{model.alias}</span>
+                                <div className={styles.modelDiscoveryNameText}>
+                                  {model.name}
+                                  {model.alias && (
+                                    <span className={styles.modelDiscoveryAlias}>
+                                      {model.alias}
+                                    </span>
+                                  )}
+                                </div>
+                                {alreadyConfigured && (
+                                  <span className={styles.modelDiscoveryAddedBadge}>
+                                    {t('ai_providers.model_discovery_already_added')}
+                                  </span>
                                 )}
                               </div>
                               {model.description && (

@@ -2,6 +2,9 @@ import { useCallback, useMemo, useReducer } from 'react';
 import { isMap, parse as parseYaml, parseDocument } from 'yaml';
 import type {
   DisableImageGenerationMode,
+  PluginStoreAuthApplyTo,
+  PluginStoreAuthRule,
+  PluginStoreAuthType,
   VisualConfigValues,
   VisualConfigValidationErrors,
 } from '@/types/visualConfig';
@@ -66,6 +69,71 @@ function parseStringArrayText(raw: unknown): string {
     .map((item) => (typeof item === 'string' ? item.trim() : ''))
     .filter(Boolean)
     .join('\n');
+}
+
+function parseStringList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((item) => String(item ?? '').trim()).filter(Boolean);
+}
+
+const PLUGIN_STORE_AUTH_TYPES: PluginStoreAuthType[] = [
+  'none',
+  'bearer',
+  'basic',
+  'header',
+  'github-token',
+];
+const PLUGIN_STORE_AUTH_APPLY_TO: PluginStoreAuthApplyTo[] = ['registry', 'metadata', 'artifact'];
+
+function parsePluginStoreAuthType(raw: unknown): PluginStoreAuthType {
+  const value = String(raw ?? '')
+    .trim()
+    .toLowerCase();
+  return PLUGIN_STORE_AUTH_TYPES.includes(value as PluginStoreAuthType)
+    ? (value as PluginStoreAuthType)
+    : 'none';
+}
+
+function parsePluginStoreAuthApplyTo(raw: unknown): PluginStoreAuthApplyTo[] {
+  return parseStringList(raw)
+    .map((item) => item.toLowerCase())
+    .filter((item): item is PluginStoreAuthApplyTo =>
+      PLUGIN_STORE_AUTH_APPLY_TO.includes(item as PluginStoreAuthApplyTo)
+    );
+}
+
+function parsePluginStoreAuthRules(raw: unknown): PluginStoreAuthRule[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item, index): PluginStoreAuthRule | null => {
+      const record = asRecord(item);
+      if (!record) return null;
+      const rule: PluginStoreAuthRule = {
+        id: `plugin-store-auth-${index}`,
+        match: typeof record.match === 'string' ? record.match : '',
+        applyTo: parsePluginStoreAuthApplyTo(record['apply-to'] ?? record.apply_to),
+        type: parsePluginStoreAuthType(record.type),
+        tokenEnv: typeof record['token-env'] === 'string' ? record['token-env'] : '',
+        usernameEnv: typeof record['username-env'] === 'string' ? record['username-env'] : '',
+        passwordEnv: typeof record['password-env'] === 'string' ? record['password-env'] : '',
+        headerName: typeof record['header-name'] === 'string' ? record['header-name'] : '',
+        headerValueEnv:
+          typeof record['header-value-env'] === 'string' ? record['header-value-env'] : '',
+        allowInsecure: Boolean(record['allow-insecure'] ?? record.allow_insecure),
+      };
+      return rule.match.trim() ||
+        rule.type !== 'none' ||
+        rule.applyTo.length > 0 ||
+        rule.tokenEnv.trim() ||
+        rule.usernameEnv.trim() ||
+        rule.passwordEnv.trim() ||
+        rule.headerName.trim() ||
+        rule.headerValueEnv.trim() ||
+        rule.allowInsecure
+        ? rule
+        : null;
+    })
+    .filter((rule): rule is PluginStoreAuthRule => Boolean(rule));
 }
 
 function resolveApiKeysText(parsed: Record<string, unknown>): string {
@@ -163,8 +231,8 @@ function setDisableImageGenerationInDoc(
   path: YamlPath,
   value: DisableImageGenerationMode
 ): void {
-  if (value === 'chat') {
-    doc.setIn(path, 'chat');
+  if (value === 'chat' || value === 'passthrough') {
+    doc.setIn(path, value);
     return;
   }
 
@@ -176,11 +244,76 @@ function setDisableImageGenerationInDoc(
   if (docHas(doc, path)) doc.setIn(path, false);
 }
 
+function serializeStringListForYaml(items?: string[]): string[] {
+  return (items ?? []).map((item) => item.trim()).filter(Boolean);
+}
+
+function serializePluginStoreAuthForYaml(
+  rules: PluginStoreAuthRule[]
+): Array<Record<string, unknown>> {
+  return rules
+    .map((rule) => {
+      const match = rule.match.trim();
+      if (!match) return null;
+      const item: Record<string, unknown> = {
+        match,
+        type: rule.type,
+      };
+      const applyTo = serializeStringListForYaml(rule.applyTo);
+      if (applyTo.length > 0) item['apply-to'] = applyTo;
+      if (rule.tokenEnv.trim()) item['token-env'] = rule.tokenEnv.trim();
+      if (rule.usernameEnv.trim()) item['username-env'] = rule.usernameEnv.trim();
+      if (rule.passwordEnv.trim()) item['password-env'] = rule.passwordEnv.trim();
+      if (rule.headerName.trim()) item['header-name'] = rule.headerName.trim();
+      if (rule.headerValueEnv.trim()) item['header-value-env'] = rule.headerValueEnv.trim();
+      if (rule.allowInsecure) item['allow-insecure'] = true;
+      return item;
+    })
+    .filter((rule): rule is Record<string, unknown> => Boolean(rule));
+}
+
+function areStringArraysEqual(left: string[] | undefined, right: string[] | undefined): boolean {
+  const leftItems = left ?? [];
+  const rightItems = right ?? [];
+  if (leftItems.length !== rightItems.length) return false;
+  return leftItems.every((item, index) => item === rightItems[index]);
+}
+
+function arePluginStoreAuthRulesEqual(
+  left: PluginStoreAuthRule[] | undefined,
+  right: PluginStoreAuthRule[] | undefined
+): boolean {
+  const leftItems = left ?? [];
+  const rightItems = right ?? [];
+  if (leftItems.length !== rightItems.length) return false;
+  return leftItems.every((a, index) => {
+    const b = rightItems[index];
+    return (
+      Boolean(b) &&
+      a.match === b.match &&
+      a.type === b.type &&
+      a.tokenEnv === b.tokenEnv &&
+      a.usernameEnv === b.usernameEnv &&
+      a.passwordEnv === b.passwordEnv &&
+      a.headerName === b.headerName &&
+      a.headerValueEnv === b.headerValueEnv &&
+      a.allowInsecure === b.allowInsecure &&
+      areStringArraysEqual(a.applyTo, b.applyTo)
+    );
+  });
+}
+
 function getNonNegativeIntegerError(value: string): 'non_negative_integer' | undefined {
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   if (!/^-?\d+$/.test(trimmed)) return 'non_negative_integer';
   return Number(trimmed) >= 0 ? undefined : 'non_negative_integer';
+}
+
+function getIntegerError(value: string): 'integer' | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return /^-?\d+$/.test(trimmed) ? undefined : 'integer';
 }
 
 function getPortError(value: string): 'port_range' | undefined {
@@ -196,7 +329,7 @@ function getRedisUsageQueueRetentionError(value: string): 'retention_seconds_ran
   if (!trimmed) return undefined;
   if (!/^\d+$/.test(trimmed)) return 'retention_seconds_range';
   const parsed = Number(trimmed);
-  return parsed >= 0 && parsed <= 3600 ? undefined : 'retention_seconds_range';
+  return parsed >= 1 && parsed <= 3600 ? undefined : 'retention_seconds_range';
 }
 
 function parseDisableImageGenerationMode(raw: unknown): DisableImageGenerationMode {
@@ -205,6 +338,7 @@ function parseDisableImageGenerationMode(raw: unknown): DisableImageGenerationMo
     const normalized = raw.trim().toLowerCase();
     if (normalized === 'true') return 'true';
     if (normalized === 'chat') return 'chat';
+    if (normalized === 'passthrough') return 'passthrough';
   }
   return 'false';
 }
@@ -219,6 +353,7 @@ export function getVisualConfigValidationErrors(
     redisUsageQueueRetentionSeconds: getRedisUsageQueueRetentionError(
       values.redisUsageQueueRetentionSeconds
     ),
+    transientErrorCooldownSeconds: getIntegerError(values.transientErrorCooldownSeconds),
     requestRetry: getNonNegativeIntegerError(values.requestRetry),
     maxRetryCredentials: getNonNegativeIntegerError(values.maxRetryCredentials),
     maxRetryInterval: getNonNegativeIntegerError(values.maxRetryInterval),
@@ -319,8 +454,15 @@ function getNextDirtyFields(
       'pluginStoreSourcesText',
       'passthroughHeaders',
       'disableCooling',
+      'saveCooldownStatus',
+      'transientErrorCooldownSeconds',
+      'disableClaudeCloakMode',
       'disableImageGeneration',
+      'gptImage2BaseModel',
+      'videoResultAuthCacheTtl',
       'authAutoRefreshWorkers',
+      'pprofEnable',
+      'pprofAddr',
       'antigravitySignatureCacheEnabled',
       'antigravitySignatureBypassStrict',
       'claudeHeaderUserAgent',
@@ -335,6 +477,13 @@ function getNextDirtyFields(
       'codexIdentityConfuse',
     ] as Array<keyof VisualConfigValues>
   ).forEach(updateScalarDirty);
+
+  if (Object.prototype.hasOwnProperty.call(patch, 'pluginStoreAuth')) {
+    updateDirty(
+      'pluginStoreAuth',
+      arePluginStoreAuthRulesEqual(nextValues.pluginStoreAuth, baselineValues.pluginStoreAuth)
+    );
+  }
 
   if (Object.prototype.hasOwnProperty.call(patch, 'host')) {
     updateDirty('host', nextValues.host === baselineValues.host);
@@ -354,8 +503,15 @@ function getNextDirtyFields(
   if (Object.prototype.hasOwnProperty.call(patch, 'rmAllowRemote')) {
     updateDirty('rmAllowRemote', nextValues.rmAllowRemote === baselineValues.rmAllowRemote);
   }
-  if (Object.prototype.hasOwnProperty.call(patch, 'rmSecretKey')) {
-    updateDirty('rmSecretKey', nextValues.rmSecretKey === baselineValues.rmSecretKey);
+  if (
+    Object.prototype.hasOwnProperty.call(patch, 'rmSecretKey') ||
+    Object.prototype.hasOwnProperty.call(patch, 'rmSecretKeyAction')
+  ) {
+    updateDirty(
+      'rmSecretKey',
+      nextValues.rmSecretKeyAction === baselineValues.rmSecretKeyAction &&
+        nextValues.rmSecretKey === baselineValues.rmSecretKey
+    );
   }
   if (Object.prototype.hasOwnProperty.call(patch, 'rmDisableControlPanel')) {
     updateDirty(
@@ -592,6 +748,7 @@ export function useVisualConfig() {
       const parsed = asRecord(parsedRaw) ?? {};
       const tls = asRecord(parsed.tls);
       const remoteManagement = asRecord(parsed['remote-management']);
+      const pprof = asRecord(parsed.pprof);
       const quotaExceeded = asRecord(parsed['quota-exceeded']);
       const routing = asRecord(parsed.routing);
       const plugins = asRecord(parsed.plugins);
@@ -610,10 +767,11 @@ export function useVisualConfig() {
         tlsKey: typeof tls?.key === 'string' ? tls.key : '',
 
         rmAllowRemote: Boolean(remoteManagement?.['allow-remote']),
-        rmSecretKey:
-          typeof remoteManagement?.['secret-key'] === 'string'
-            ? remoteManagement['secret-key']
-            : '',
+        rmSecretKey: '',
+        rmSecretKeyAction: 'unchanged',
+        rmSecretKeyConfigured:
+          typeof remoteManagement?.['secret-key'] === 'string' &&
+          remoteManagement['secret-key'].length > 0,
         rmDisableControlPanel: Boolean(remoteManagement?.['disable-control-panel']),
         rmDisableAutoUpdatePanel: Boolean(remoteManagement?.['disable-auto-update-panel']),
         rmPanelRepo:
@@ -630,8 +788,11 @@ export function useVisualConfig() {
         pluginStoreSourcesText: parseStringArrayText(
           plugins?.['store-sources'] ?? plugins?.storeSources
         ),
+        pluginStoreAuth: parsePluginStoreAuthRules(plugins?.['store-auth'] ?? plugins?.storeAuth),
 
         debug: Boolean(parsed.debug),
+        pprofEnable: Boolean(pprof?.enable),
+        pprofAddr: typeof pprof?.addr === 'string' ? pprof.addr : '127.0.0.1:8316',
         commercialMode: Boolean(parsed['commercial-mode']),
         usageStatisticsEnabled: Boolean(
           parsed['usage-statistics-enabled'] ?? parsed.usageStatisticsEnabled
@@ -652,9 +813,20 @@ export function useVisualConfig() {
         maxRetryCredentials: String(parsed['max-retry-credentials'] ?? ''),
         maxRetryInterval: String(parsed['max-retry-interval'] ?? ''),
         disableCooling: Boolean(parsed['disable-cooling']),
+        saveCooldownStatus: Boolean(parsed['save-cooldown-status']),
+        transientErrorCooldownSeconds: String(parsed['transient-error-cooldown-seconds'] ?? ''),
+        disableClaudeCloakMode: Boolean(parsed['disable-claude-cloak-mode']),
         disableImageGeneration: parseDisableImageGenerationMode(parsed['disable-image-generation']),
+        gptImage2BaseModel:
+          typeof parsed['gpt-image-2-base-model'] === 'string'
+            ? parsed['gpt-image-2-base-model']
+            : '',
+        videoResultAuthCacheTtl:
+          typeof parsed['video-result-auth-cache-ttl'] === 'string'
+            ? parsed['video-result-auth-cache-ttl']
+            : '',
         authAutoRefreshWorkers: String(parsed['auth-auto-refresh-workers'] ?? ''),
-        wsAuth: Boolean(parsed['ws-auth']),
+        wsAuth: Boolean(parsed['ws-auth'] ?? true),
         antigravitySignatureCacheEnabled: Boolean(
           parsed['antigravity-signature-cache-enabled'] ?? true
         ),
@@ -689,8 +861,8 @@ export function useVisualConfig() {
             : '',
         codexIdentityConfuse: Boolean(codex?.['identity-confuse'] ?? codex?.identityConfuse),
 
-        quotaSwitchProject: Boolean(quotaExceeded?.['switch-project'] ?? true),
-        quotaSwitchPreviewModel: Boolean(quotaExceeded?.['switch-preview-model'] ?? true),
+        quotaSwitchProject: Boolean(quotaExceeded?.['switch-project'] ?? false),
+        quotaSwitchPreviewModel: Boolean(quotaExceeded?.['switch-preview-model'] ?? false),
         quotaAntigravityCredits: Boolean(quotaExceeded?.['antigravity-credits'] ?? false),
 
         routingStrategy: routing?.strategy === 'fill-first' ? 'fill-first' : 'round-robin',
@@ -754,17 +926,24 @@ export function useVisualConfig() {
           deleteIfMapEmpty(doc, ['tls']);
         }
 
+        const hasRemoteManagementSecretKeyUpdate =
+          values.rmSecretKeyAction === 'clear' ||
+          (values.rmSecretKeyAction === 'replace' && values.rmSecretKey.length > 0);
         if (
           docHas(doc, ['remote-management']) ||
           values.rmAllowRemote ||
-          values.rmSecretKey.trim() ||
+          hasRemoteManagementSecretKeyUpdate ||
           values.rmDisableControlPanel ||
           values.rmDisableAutoUpdatePanel ||
           values.rmPanelRepo.trim()
         ) {
           ensureMapInDoc(doc, ['remote-management']);
           setBooleanInDoc(doc, ['remote-management', 'allow-remote'], values.rmAllowRemote);
-          setStringInDoc(doc, ['remote-management', 'secret-key'], values.rmSecretKey);
+          if (values.rmSecretKeyAction === 'replace' && values.rmSecretKey.length > 0) {
+            doc.setIn(['remote-management', 'secret-key'], values.rmSecretKey);
+          } else if (values.rmSecretKeyAction === 'clear') {
+            doc.setIn(['remote-management', 'secret-key'], '');
+          }
           setBooleanInDoc(
             doc,
             ['remote-management', 'disable-control-panel'],
@@ -796,6 +975,25 @@ export function useVisualConfig() {
 
         setBooleanInDoc(doc, ['debug'], values.debug);
 
+        const shouldWritePprofEnable = shouldWriteManagedField(
+          doc,
+          ['pprof', 'enable'],
+          dirtyFields,
+          'pprofEnable'
+        );
+        const shouldWritePprofAddr = shouldWriteManagedField(
+          doc,
+          ['pprof', 'addr'],
+          dirtyFields,
+          'pprofAddr'
+        );
+        if (docHas(doc, ['pprof']) || shouldWritePprofEnable || shouldWritePprofAddr) {
+          ensureMapInDoc(doc, ['pprof']);
+          if (shouldWritePprofEnable) doc.setIn(['pprof', 'enable'], values.pprofEnable);
+          if (shouldWritePprofAddr) setStringInDoc(doc, ['pprof', 'addr'], values.pprofAddr);
+          deleteIfMapEmpty(doc, ['pprof']);
+        }
+
         setBooleanInDoc(doc, ['commercial-mode'], values.commercialMode);
         setBooleanInDoc(doc, ['usage-statistics-enabled'], values.usageStatisticsEnabled);
         setBooleanInDoc(doc, ['logging-to-file'], values.loggingToFile);
@@ -820,6 +1018,7 @@ export function useVisualConfig() {
           .split('\n')
           .map((source) => source.trim())
           .filter(Boolean);
+        const shouldWritePluginStoreAuth = dirtyFields.has('pluginStoreAuth');
         const shouldWritePluginsEnabled = shouldWriteManagedField(
           doc,
           ['plugins', 'enabled'],
@@ -842,7 +1041,9 @@ export function useVisualConfig() {
           values.pluginsEnabled ||
           shouldWritePluginsEnabled ||
           shouldWritePluginsDir ||
-          shouldWritePluginStoreSources
+          shouldWritePluginStoreSources ||
+          shouldWritePluginStoreAuth ||
+          shouldWriteManagedField(doc, ['plugins', 'store-auth'], dirtyFields, 'pluginStoreAuth')
         ) {
           ensureMapInDoc(doc, ['plugins']);
           setBooleanInDoc(doc, ['plugins', 'enabled'], values.pluginsEnabled);
@@ -860,6 +1061,14 @@ export function useVisualConfig() {
               doc.deleteIn(['plugins', 'store-sources']);
             }
           }
+          if (shouldWritePluginStoreAuth) {
+            const storeAuth = serializePluginStoreAuthForYaml(values.pluginStoreAuth);
+            if (storeAuth.length > 0) {
+              doc.setIn(['plugins', 'store-auth'], storeAuth);
+            } else if (docHas(doc, ['plugins', 'store-auth'])) {
+              doc.deleteIn(['plugins', 'store-auth']);
+            }
+          }
           deleteIfMapEmpty(doc, ['plugins']);
         }
 
@@ -870,13 +1079,24 @@ export function useVisualConfig() {
         setIntFromStringInDoc(doc, ['max-retry-credentials'], values.maxRetryCredentials);
         setIntFromStringInDoc(doc, ['max-retry-interval'], values.maxRetryInterval);
         setBooleanInDoc(doc, ['disable-cooling'], values.disableCooling);
+        setBooleanInDoc(doc, ['save-cooldown-status'], values.saveCooldownStatus);
+        setIntFromStringInDoc(
+          doc,
+          ['transient-error-cooldown-seconds'],
+          values.transientErrorCooldownSeconds
+        );
+        setBooleanInDoc(doc, ['disable-claude-cloak-mode'], values.disableClaudeCloakMode);
         setDisableImageGenerationInDoc(
           doc,
           ['disable-image-generation'],
           values.disableImageGeneration
         );
+        setStringInDoc(doc, ['gpt-image-2-base-model'], values.gptImage2BaseModel);
+        setStringInDoc(doc, ['video-result-auth-cache-ttl'], values.videoResultAuthCacheTtl);
         setIntFromStringInDoc(doc, ['auth-auto-refresh-workers'], values.authAutoRefreshWorkers);
-        setBooleanInDoc(doc, ['ws-auth'], values.wsAuth);
+        if (shouldWriteManagedField(doc, ['ws-auth'], dirtyFields, 'wsAuth')) {
+          doc.setIn(['ws-auth'], values.wsAuth);
+        }
         if (
           docHas(doc, ['antigravity-signature-cache-enabled']) ||
           !values.antigravitySignatureCacheEnabled
@@ -967,26 +1187,40 @@ export function useVisualConfig() {
           deleteIfMapEmpty(doc, ['codex']);
         }
 
+        const writeQuotaSwitchProject = shouldWriteManagedField(
+          doc,
+          ['quota-exceeded', 'switch-project'],
+          dirtyFields,
+          'quotaSwitchProject'
+        );
+        const writeQuotaSwitchPreviewModel = shouldWriteManagedField(
+          doc,
+          ['quota-exceeded', 'switch-preview-model'],
+          dirtyFields,
+          'quotaSwitchPreviewModel'
+        );
+        const writeQuotaAntigravityCredits = shouldWriteManagedField(
+          doc,
+          ['quota-exceeded', 'antigravity-credits'],
+          dirtyFields,
+          'quotaAntigravityCredits'
+        );
         if (
           docHas(doc, ['quota-exceeded']) ||
-          !values.quotaSwitchProject ||
-          !values.quotaSwitchPreviewModel ||
-          shouldWriteManagedField(
-            doc,
-            ['quota-exceeded', 'antigravity-credits'],
-            dirtyFields,
-            'quotaAntigravityCredits'
-          )
+          writeQuotaSwitchProject ||
+          writeQuotaSwitchPreviewModel ||
+          writeQuotaAntigravityCredits
         ) {
           ensureMapInDoc(doc, ['quota-exceeded']);
-          const writeQuotaAntigravityCredits = shouldWriteManagedField(
-            doc,
-            ['quota-exceeded', 'antigravity-credits'],
-            dirtyFields,
-            'quotaAntigravityCredits'
-          );
-          doc.setIn(['quota-exceeded', 'switch-project'], values.quotaSwitchProject);
-          doc.setIn(['quota-exceeded', 'switch-preview-model'], values.quotaSwitchPreviewModel);
+          if (writeQuotaSwitchProject) {
+            doc.setIn(['quota-exceeded', 'switch-project'], values.quotaSwitchProject);
+          }
+          if (writeQuotaSwitchPreviewModel) {
+            doc.setIn(
+              ['quota-exceeded', 'switch-preview-model'],
+              values.quotaSwitchPreviewModel
+            );
+          }
           if (writeQuotaAntigravityCredits) {
             doc.setIn(['quota-exceeded', 'antigravity-credits'], values.quotaAntigravityCredits);
           }
