@@ -1,0 +1,215 @@
+name: Deploy Lumio Production
+
+# One-shot / manual Lumio production path. Keep this off `main`.
+# `main` stays aligned with upstream; this workflow exists so Go1c can
+# build ghcr.io/go1c/cpa-manager-plus and SSH-deploy without relying on
+# LumioServerWorkFlow GHCR write access.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Ref to build (branch, tag, or SHA)"
+        required: true
+        type: string
+        default: e84ff86a98fa422b6093f18e62687f3b417e7957
+      image_tag:
+        description: "GHCR tag to publish and deploy"
+        required: true
+        type: string
+        default: v1.12.2-go1c.1
+      deploy:
+        description: "Deploy to production after building the image"
+        required: true
+        type: boolean
+        default: true
+      deploy_target:
+        description: "Which CPA-Manager instance to deploy"
+        required: false
+        type: choice
+        options:
+          - a
+          - b
+          - both
+        default: both
+  push:
+    branches:
+      - go1c/deploy-v1.12.2-go1c.1
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/go1c/cpa-manager-plus
+  DEFAULT_SOURCE_REF: e84ff86a98fa422b6093f18e62687f3b417e7957
+  DEFAULT_IMAGE_TAG: v1.12.2-go1c.1
+
+jobs:
+  build-test-push-deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cpa-manager-plus-lumio-production
+      cancel-in-progress: false
+
+    steps:
+      - name: Resolve build inputs
+        id: params
+        run: |
+          set -euo pipefail
+          source_ref="${{ github.event.inputs.source_ref }}"
+          image_tag="${{ github.event.inputs.image_tag }}"
+          deploy="${{ github.event.inputs.deploy }}"
+          deploy_target="${{ github.event.inputs.deploy_target }}"
+
+          if [ -z "${source_ref}" ]; then
+            source_ref="${DEFAULT_SOURCE_REF}"
+          fi
+          if [ -z "${image_tag}" ]; then
+            image_tag="${DEFAULT_IMAGE_TAG}"
+          fi
+          if [ "${{ github.event_name }}" = "push" ]; then
+            deploy="true"
+            deploy_target="both"
+          elif [ -z "${deploy}" ]; then
+            deploy="true"
+          fi
+          if [ -z "${deploy_target}" ]; then
+            deploy_target="both"
+          fi
+
+          {
+            echo "source_ref=${source_ref}"
+            echo "image_tag=${image_tag}"
+            echo "image=${IMAGE_NAME}:${image_tag}"
+            echo "deploy=${deploy}"
+            echo "deploy_target=${deploy_target}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.params.outputs.source_ref }}
+          path: source
+
+      - name: Record source SHA
+        id: meta
+        working-directory: source
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          {
+            echo "source_sha=${source_sha}"
+            echo "source_short=${source_sha:0:12}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: source/apps/manager-server/go.sum
+
+      - name: Test source
+        working-directory: source
+        run: |
+          npm ci
+          npm run type-check
+          npm run lint
+          npm run build
+          npm run manager-server:test
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: source
+          file: source/Dockerfile.manager-server
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.params.outputs.image }}
+            ${{ env.IMAGE_NAME }}:production
+          labels: |
+            org.opencontainers.image.title=CPA Manager Plus
+            org.opencontainers.image.source=https://github.com/Go1c/CPA-Manager-Plus
+            org.opencontainers.image.revision=${{ steps.meta.outputs.source_sha }}
+            org.opencontainers.image.version=${{ steps.params.outputs.image_tag }}
+          build-args: |
+            VERSION=${{ steps.params.outputs.image_tag }}
+
+      - name: Prepare SSH
+        if: ${{ steps.params.outputs.deploy == 'true' }}
+        env:
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+          PROD_SSH_KNOWN_HOSTS: ${{ secrets.PROD_SSH_KNOWN_HOSTS }}
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "$PROD_SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$PROD_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "$PROD_HOST" > ~/.ssh/known_hosts
+          fi
+
+      - name: Deploy to production
+        if: ${{ steps.params.outputs.deploy == 'true' }}
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          IMAGE: ${{ steps.params.outputs.image }}
+          TARGET: ${{ steps.params.outputs.deploy_target }}
+        run: |
+          set -euo pipefail
+          remote_cmd=""
+          case "${TARGET}" in
+            a)
+              remote_cmd="HEALTH_RETRIES=40 HEALTH_SLEEP=5 INSTANCE=a /opt/lumio/bin/deploy-cpa-manager.sh '${IMAGE}'"
+              ;;
+            b)
+              remote_cmd="HEALTH_RETRIES=40 HEALTH_SLEEP=5 INSTANCE=b /opt/lumio/bin/deploy-cpa-manager.sh '${IMAGE}'"
+              ;;
+            both)
+              remote_cmd="HEALTH_RETRIES=40 HEALTH_SLEEP=5 INSTANCE=a /opt/lumio/bin/deploy-cpa-manager.sh '${IMAGE}' && HEALTH_RETRIES=40 HEALTH_SLEEP=5 INSTANCE=b /opt/lumio/bin/deploy-cpa-manager.sh '${IMAGE}'"
+              ;;
+            *)
+              echo "Unknown deploy_target: ${TARGET}" >&2
+              exit 2
+              ;;
+          esac
+          echo "Deploy target=${TARGET} image=${IMAGE}"
+          ssh \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            "${PROD_USER:-deploy}@${PROD_HOST}" \
+            "${remote_cmd}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### CPA-Manager-Plus Lumio production build"
+            echo ""
+            echo "- Source: \`Go1c/CPA-Manager-Plus@${{ steps.params.outputs.source_ref }}\`"
+            echo "- Source SHA: \`${{ steps.meta.outputs.source_sha }}\`"
+            echo "- Image: \`${{ steps.params.outputs.image }}\`"
+            echo "- Deploy requested: \`${{ steps.params.outputs.deploy }}\`"
+            echo "- Deploy target: \`${{ steps.params.outputs.deploy_target }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
