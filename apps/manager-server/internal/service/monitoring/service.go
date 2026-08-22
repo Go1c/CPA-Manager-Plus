@@ -2,15 +2,21 @@ package monitoring
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/codexquota"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/pricing"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/usagehourly"
+	monitoringrollup "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/usagemonitoring"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/store"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
 
 const (
@@ -23,16 +29,88 @@ const (
 	maxHeaderSnapshotDays      = 365
 	maxHeaderSnapshotLimit     = 5000
 	maxAccountHistoryTargets   = 200
+	maxAccountWindowUsageItems = 400
 	accountHistoryCatchUpLimit = 5000
+	accountRecentRequestLimit  = 10
 	recentWindowMS             = 30 * 60 * 1000
+	// analyticsPrefetchConcurrency limits background analytics reads. The
+	// foreground summary/task path may hold one additional SQLite connection.
+	analyticsPrefetchConcurrency = 2
 )
 
 type Service struct {
-	store *store.Store
+	store            *store.Store
+	hourlyReader     *usagehourly.Reader
+	monitoringReader *monitoringrollup.Reader
 }
 
-func New(store *store.Store) *Service {
-	return &Service{store: store}
+type analyticsQueryGroup struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	semaphore chan struct{}
+	waitGroup sync.WaitGroup
+	errorOnce sync.Once
+	waitOnce  sync.Once
+	err       error
+}
+
+func newAnalyticsQueryGroup(ctx context.Context, concurrency int) *analyticsQueryGroup {
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	queryCtx, cancel := context.WithCancel(ctx)
+	return &analyticsQueryGroup{
+		ctx:       queryCtx,
+		cancel:    cancel,
+		semaphore: make(chan struct{}, concurrency),
+	}
+}
+
+func (g *analyticsQueryGroup) Go(query func(context.Context) error) {
+	g.waitGroup.Add(1)
+	go func() {
+		defer g.waitGroup.Done()
+		select {
+		case g.semaphore <- struct{}{}:
+			defer func() { <-g.semaphore }()
+		case <-g.ctx.Done():
+			return
+		}
+		if err := query(g.ctx); err != nil {
+			g.errorOnce.Do(func() {
+				g.err = err
+				g.cancel()
+			})
+		}
+	}()
+}
+
+func (g *analyticsQueryGroup) Wait() error {
+	g.waitOnce.Do(func() {
+		g.waitGroup.Wait()
+		if g.err == nil && g.ctx.Err() != nil {
+			g.err = g.ctx.Err()
+		}
+		g.cancel()
+	})
+	return g.err
+}
+
+func (g *analyticsQueryGroup) Close() {
+	g.cancel()
+	_ = g.Wait()
+}
+
+func New(store *store.Store, hourlyRollupEnabled ...bool) *Service {
+	enabled := false
+	if len(hourlyRollupEnabled) > 0 {
+		enabled = hourlyRollupEnabled[0]
+	}
+	return &Service{
+		store:            store,
+		hourlyReader:     usagehourly.New(store, enabled, "monitoring-rollup"),
+		monitoringReader: monitoringrollup.New(store),
+	}
 }
 
 type Request struct {
@@ -50,6 +128,7 @@ type Filters struct {
 	Models           []string `json:"models"`
 	Providers        []string `json:"providers"`
 	Accounts         []string `json:"accounts"`
+	CredentialIDs    []string `json:"credential_ids"`
 	AuthFiles        []string `json:"auth_files"`
 	AuthIndices      []string `json:"auth_indices"`
 	APIKeyHashes     []string `json:"api_key_hashes"`
@@ -68,6 +147,8 @@ type Filters struct {
 
 type Include struct {
 	Summary            bool              `json:"summary"`
+	SummaryProfile     string            `json:"summary_profile"`
+	SummaryPercentiles bool              `json:"summary_percentiles"`
 	SummaryComparison  bool              `json:"summary_comparison"`
 	Timeline           bool              `json:"timeline"`
 	HourlyDistribution bool              `json:"hourly_distribution"`
@@ -78,6 +159,7 @@ type Include struct {
 	AccountStats       bool              `json:"account_stats"`
 	CredentialStats    bool              `json:"credential_stats"`
 	CredentialTimeline bool              `json:"credential_timeline"`
+	APIKeyTimeline     bool              `json:"api_key_timeline"`
 	APIKeyStats        bool              `json:"api_key_stats"`
 	FilterOptions      bool              `json:"filter_options"`
 	FilterSelectors    bool              `json:"filter_selectors"`
@@ -118,6 +200,7 @@ type Response struct {
 	AccountStats       []AccountStatRow          `json:"account_stats,omitempty"`
 	CredentialStats    []CredentialStatRow       `json:"credential_stats,omitempty"`
 	CredentialTimeline []CredentialTimelinePoint `json:"credential_timeline,omitempty"`
+	APIKeyTimeline     []APIKeyTimelinePoint     `json:"api_key_timeline,omitempty"`
 	APIKeyStats        []APIKeyStatRow           `json:"api_key_stats,omitempty"`
 	FilterOptions      *FilterOptions            `json:"filter_options,omitempty"`
 	TaskBuckets        []TaskBucketRow           `json:"task_buckets,omitempty"`
@@ -144,11 +227,15 @@ type AccountHistoryRequest struct {
 }
 
 type AccountHistoryTarget struct {
-	AccountKey        string `json:"account_key,omitempty"`
-	AccountSnapshot   string `json:"account_snapshot,omitempty"`
-	AuthLabelSnapshot string `json:"auth_label_snapshot,omitempty"`
-	AuthIndex         string `json:"auth_index,omitempty"`
-	Source            string `json:"source,omitempty"`
+	RowKey                string `json:"row_key"`
+	AccountKey            string `json:"account_key,omitempty"`
+	AccountSnapshot       string `json:"account_snapshot,omitempty"`
+	AuthLabelSnapshot     string `json:"auth_label_snapshot,omitempty"`
+	AuthFileSnapshot      string `json:"auth_file_snapshot,omitempty"`
+	AuthProviderSnapshot  string `json:"auth_provider_snapshot,omitempty"`
+	AuthProjectIDSnapshot string `json:"auth_project_id_snapshot,omitempty"`
+	AuthIndex             string `json:"auth_index,omitempty"`
+	Source                string `json:"source,omitempty"`
 }
 
 type AccountHistoryResponse struct {
@@ -165,17 +252,140 @@ type AccountHistoryCheckpointState struct {
 }
 
 type AccountHistoryItem struct {
-	AccountKey    string   `json:"account_key"`
-	Matched       bool     `json:"matched"`
-	TotalRequests int64    `json:"total_requests"`
-	SuccessCalls  int64    `json:"success_calls"`
-	FailureCalls  int64    `json:"failure_calls"`
-	TotalTokens   int64    `json:"total_tokens"`
-	TotalCost     float64  `json:"total_cost"`
-	SuccessRate   *float64 `json:"success_rate"`
-	FirstSeenMS   *int64   `json:"first_seen_ms"`
-	LastSeenMS    *int64   `json:"last_seen_ms"`
-	SyncStatus    string   `json:"sync_status"`
+	RowKey         string                 `json:"row_key"`
+	AccountKey     string                 `json:"account_key"`
+	Matched        bool                   `json:"matched"`
+	TotalRequests  int64                  `json:"total_requests"`
+	SuccessCalls   int64                  `json:"success_calls"`
+	FailureCalls   int64                  `json:"failure_calls"`
+	TotalTokens    int64                  `json:"total_tokens"`
+	TotalCost      float64                `json:"total_cost"`
+	SuccessRate    *float64               `json:"success_rate"`
+	FirstSeenMS    *int64                 `json:"first_seen_ms"`
+	LastSeenMS     *int64                 `json:"last_seen_ms"`
+	LatestRequest  *AccountLatestRequest  `json:"latest_request,omitempty"`
+	RecentRequests []AccountLatestRequest `json:"recent_requests,omitempty"`
+	SyncStatus     string                 `json:"sync_status"`
+}
+
+// AccountLatestRequest is the most recent persisted request for an auth file.
+// It intentionally exposes only the already-sanitized diagnostic summary and
+// selected response-header metadata, never raw response bodies.
+type AccountLatestRequest struct {
+	TimestampMS     int64  `json:"timestamp_ms"`
+	Failed          bool   `json:"failed"`
+	FailStatusCode  *int   `json:"fail_status_code,omitempty"`
+	FailSummary     string `json:"fail_summary,omitempty"`
+	HeaderErrorKind string `json:"header_error_kind,omitempty"`
+	HeaderErrorCode string `json:"header_error_code,omitempty"`
+	HeaderTraceID   string `json:"header_trace_id,omitempty"`
+}
+
+type AccountWindowUsageRequest struct {
+	Windows []AccountWindowUsageTarget `json:"windows"`
+}
+
+type AccountWindowUsageTarget struct {
+	RequestKey            string                  `json:"request_key,omitempty"`
+	RowKey                string                  `json:"row_key"`
+	WindowKey             string                  `json:"window_key,omitempty"`
+	ProviderWindowID      string                  `json:"provider_window_id,omitempty"`
+	Period                string                  `json:"period,omitempty"`
+	FromMS                int64                   `json:"from_ms"`
+	ToMS                  int64                   `json:"to_ms"`
+	ModelScope            AccountWindowModelScope `json:"model_scope,omitempty"`
+	ModelScopeProvided    bool                    `json:"-"`
+	ModelScopeCompleteSet bool                    `json:"-"`
+	AccountSnapshot       string                  `json:"account_snapshot,omitempty"`
+	AuthLabelSnapshot     string                  `json:"auth_label_snapshot,omitempty"`
+	AuthFileSnapshot      string                  `json:"auth_file_snapshot,omitempty"`
+	AuthProviderSnapshot  string                  `json:"auth_provider_snapshot,omitempty"`
+	AuthProjectIDSnapshot string                  `json:"auth_project_id_snapshot,omitempty"`
+	AuthIndex             string                  `json:"auth_index,omitempty"`
+	Source                string                  `json:"source,omitempty"`
+}
+
+func (target *AccountWindowUsageTarget) UnmarshalJSON(data []byte) error {
+	type alias AccountWindowUsageTarget
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	// This type has a custom unmarshaler so it can distinguish an omitted
+	// legacy model_scope from an explicitly incomplete scope. Keep the
+	// controller's DisallowUnknownFields contract for the target itself while
+	// allowing forward-compatible metadata inside model_scope.
+	knownFields := map[string]struct{}{
+		"request_key": {}, "row_key": {}, "window_key": {}, "provider_window_id": {},
+		"period": {}, "from_ms": {}, "to_ms": {}, "model_scope": {},
+		"account_snapshot": {}, "auth_label_snapshot": {}, "auth_file_snapshot": {},
+		"auth_provider_snapshot": {}, "auth_project_id_snapshot": {}, "auth_index": {},
+		"source": {},
+	}
+	for field := range fields {
+		if _, ok := knownFields[field]; ok {
+			continue
+		}
+		matched := false
+		for known := range knownFields {
+			if strings.EqualFold(field, known) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("json: unknown field %q", field)
+		}
+	}
+	*target = AccountWindowUsageTarget(decoded)
+	rawScope, provided := fields["model_scope"]
+	if !provided || strings.TrimSpace(string(rawScope)) == "null" {
+		return nil
+	}
+	target.ModelScopeProvided = true
+	var scopeFields map[string]json.RawMessage
+	if err := json.Unmarshal(rawScope, &scopeFields); err != nil {
+		return err
+	}
+	_, target.ModelScopeCompleteSet = scopeFields["complete"]
+	return nil
+}
+
+type AccountWindowModelScope struct {
+	Kind     string   `json:"kind,omitempty"`
+	Key      string   `json:"key,omitempty"`
+	Models   []string `json:"models,omitempty"`
+	Complete bool     `json:"complete,omitempty"`
+}
+
+type AccountWindowUsageResponse struct {
+	GeneratedAtMS int64                    `json:"generated_at_ms"`
+	Items         []AccountWindowUsageItem `json:"items"`
+}
+
+type AccountWindowUsageItem struct {
+	RequestKey        string   `json:"request_key"`
+	RowKey            string   `json:"row_key"`
+	WindowKey         string   `json:"window_key,omitempty"`
+	ProviderWindowID  string   `json:"provider_window_id"`
+	Period            string   `json:"period"`
+	FromMS            int64    `json:"from_ms"`
+	ToMS              int64    `json:"to_ms"`
+	Matched           bool     `json:"matched"`
+	TotalRequests     int64    `json:"total_requests"`
+	SuccessCalls      int64    `json:"success_calls"`
+	FailureCalls      int64    `json:"failure_calls"`
+	TotalTokens       int64    `json:"total_tokens"`
+	TotalCost         float64  `json:"total_cost"`
+	SuccessRate       *float64 `json:"success_rate"`
+	LastSeenMS        *int64   `json:"last_seen_ms"`
+	SyncStatus        string   `json:"sync_status"`
+	ScopeMatchStatus  string   `json:"scope_match_status"`
+	UnmatchedRequests int64    `json:"unmatched_requests"`
 }
 
 type Summary struct {
@@ -188,6 +398,7 @@ type Summary struct {
 	CachedTokens          int64    `json:"cached_tokens"`
 	CacheReadTokens       int64    `json:"cache_read_tokens"`
 	CacheCreationTokens   int64    `json:"cache_creation_tokens"`
+	CacheHitRate          float64  `json:"cache_hit_rate"`
 	ReasoningTokens       int64    `json:"reasoning_tokens"`
 	TotalTokens           int64    `json:"total_tokens"`
 	TotalCost             float64  `json:"total_cost"`
@@ -233,6 +444,7 @@ type TimelinePoint struct {
 	CachedTokens        int64    `json:"cached_tokens"`
 	CacheReadTokens     int64    `json:"cache_read_tokens"`
 	CacheCreationTokens int64    `json:"cache_creation_tokens"`
+	CacheHitRate        float64  `json:"cache_hit_rate"`
 	ReasoningTokens     int64    `json:"reasoning_tokens"`
 	TotalTokens         int64    `json:"total_tokens"`
 	Cost                float64  `json:"cost"`
@@ -311,6 +523,9 @@ type ModelStat struct {
 	CachedTokens        int64   `json:"cached_tokens"`
 	CacheReadTokens     int64   `json:"cache_read_tokens"`
 	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	CacheHitTokens      int64   `json:"cache_hit_tokens"`
+	CacheHitInputTokens int64   `json:"cache_hit_input_tokens"`
+	CacheHitRate        float64 `json:"cache_hit_rate"`
 	TotalTokens         int64   `json:"total_tokens"`
 	Cost                float64 `json:"cost"`
 }
@@ -422,6 +637,27 @@ type CredentialTimelinePoint struct {
 	FailureRate           float64  `json:"failure_rate"`
 }
 
+type APIKeyTimelinePoint struct {
+	APIKeyHash          string   `json:"api_key_hash"`
+	BucketMS            int64    `json:"bucket_ms"`
+	BucketLabel         string   `json:"bucket_label"`
+	Calls               int64    `json:"calls"`
+	Tokens              int64    `json:"tokens"`
+	Success             int64    `json:"success"`
+	Failure             int64    `json:"failure"`
+	InputTokens         int64    `json:"input_tokens"`
+	OutputTokens        int64    `json:"output_tokens"`
+	CachedTokens        int64    `json:"cached_tokens"`
+	CacheReadTokens     int64    `json:"cache_read_tokens"`
+	CacheCreationTokens int64    `json:"cache_creation_tokens"`
+	ReasoningTokens     int64    `json:"reasoning_tokens"`
+	TotalTokens         int64    `json:"total_tokens"`
+	Cost                float64  `json:"cost"`
+	AvgLatencyMS        *float64 `json:"average_latency_ms"`
+	SuccessRate         float64  `json:"success_rate"`
+	FailureRate         float64  `json:"failure_rate"`
+}
+
 type AccountModelStatRow struct {
 	Model               string  `json:"model"`
 	Calls               int64   `json:"calls"`
@@ -433,6 +669,9 @@ type AccountModelStatRow struct {
 	CachedTokens        int64   `json:"cached_tokens"`
 	CacheReadTokens     int64   `json:"cache_read_tokens"`
 	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	CacheHitTokens      int64   `json:"cache_hit_tokens"`
+	CacheHitInputTokens int64   `json:"cache_hit_input_tokens"`
+	CacheHitRate        float64 `json:"cache_hit_rate"`
 	TotalTokens         int64   `json:"total_tokens"`
 	Cost                float64 `json:"cost"`
 	LastSeenMS          int64   `json:"last_seen_ms"`
@@ -492,6 +731,9 @@ type FilterOptions struct {
 	APIKeyHashes     []string          `json:"api_key_hashes,omitempty"`
 	Providers        []string          `json:"providers,omitempty"`
 	AuthFiles        []string          `json:"auth_files,omitempty"`
+	Accounts         []string          `json:"accounts,omitempty"`
+	AccountCount     int               `json:"account_count,omitempty"`
+	APIKeyCount      int               `json:"api_key_count,omitempty"`
 	ProjectIDs       []string          `json:"project_ids,omitempty"`
 	RequestTypes     []string          `json:"request_types,omitempty"`
 	HeaderErrorKinds []string          `json:"header_error_kinds,omitempty"`
@@ -549,6 +791,10 @@ type RecentFailure struct {
 type HeaderSnapshot struct {
 	EventHash              string                        `json:"event_hash"`
 	TimestampMS            int64                         `json:"timestamp_ms"`
+	Model                  string                        `json:"model,omitempty"`
+	AnalyticsModel         string                        `json:"analytics_model,omitempty"`
+	RequestedModel         string                        `json:"requested_model,omitempty"`
+	ResolvedModel          string                        `json:"resolved_model,omitempty"`
 	AuthFileSnapshot       string                        `json:"auth_file_snapshot,omitempty"`
 	AuthIndex              string                        `json:"auth_index,omitempty"`
 	AccountSnapshot        string                        `json:"account_snapshot,omitempty"`
@@ -579,10 +825,15 @@ type EventRow struct {
 	EventHash              string                        `json:"event_hash"`
 	TimestampMS            int64                         `json:"timestamp_ms"`
 	Model                  string                        `json:"model"`
+	AnalyticsModel         string                        `json:"analytics_model,omitempty"`
+	RequestedModel         string                        `json:"requested_model,omitempty"`
 	ResolvedModel          string                        `json:"resolved_model,omitempty"`
 	Endpoint               string                        `json:"endpoint"`
 	Method                 string                        `json:"method"`
 	Path                   string                        `json:"path"`
+	ClientIP               string                        `json:"client_ip,omitempty"`
+	XForwardedFor          string                        `json:"x_forwarded_for,omitempty"`
+	UserAgent              string                        `json:"user_agent,omitempty"`
 	AuthIndex              string                        `json:"auth_index"`
 	Source                 string                        `json:"source"`
 	SourceHash             string                        `json:"source_hash"`
@@ -617,6 +868,16 @@ type EventRow struct {
 }
 
 func (s *Service) Analytics(ctx context.Context, req Request) (Response, error) {
+	var response Response
+	err := s.store.WithModelPriceSnapshot(func() error {
+		var analyticsErr error
+		response, analyticsErr = s.analytics(ctx, req)
+		return analyticsErr
+	})
+	return response, err
+}
+
+func (s *Service) analytics(ctx context.Context, req Request) (Response, error) {
 	if req.FromMS <= 0 || req.ToMS <= 0 || req.FromMS >= req.ToMS {
 		return Response{}, errors.New("from_ms and to_ms are required and from_ms must be less than to_ms")
 	}
@@ -630,10 +891,7 @@ func (s *Service) Analytics(ctx context.Context, req Request) (Response, error) 
 		return Response{}, err
 	}
 	filter := buildFilter(req)
-	prices, err := s.store.LoadModelPrices(ctx)
-	if err != nil {
-		return Response{}, err
-	}
+	var prices map[string]store.ModelPrice
 
 	response := Response{
 		GeneratedAtMS: time.Now().UnixMilli(),
@@ -645,185 +903,176 @@ func (s *Service) Analytics(ctx context.Context, req Request) (Response, error) 
 	// (summary and events use the exact same filter).
 	var summaryTotalCalls int64
 	summaryComputed := false
+	compactSummary := req.Include.Summary && req.Include.SummaryProfile == "compact"
+	rollupEligible := analyticsHourlyRollupEligible(filter)
+	needsHourlyAggregates := req.Include.Summary || req.Include.ModelShare || req.Include.ModelStats
+	needsHourlyTimeline := req.Include.Timeline || req.Include.AnomalyPoints
+	hourlyTimelineRepresentable := rollupEligible && needsHourlyTimeline && s.hourlyReader.CanRepresentAnalyticsTimeline(req.FromMS, req.ToMS, granularity, location)
+	needsHourlyCore := needsHourlyAggregates || hourlyTimelineRepresentable
+	var hourlySnapshot usagehourly.Snapshot
+	hourlySnapshotAvailable := false
+	if rollupEligible && needsHourlyCore {
+		hourlySnapshot, hourlySnapshotAvailable = s.hourlyReader.LoadAnalytics(
+			ctx,
+			filter,
+			granularity,
+			location,
+			hourlyTimelineRepresentable,
+		)
+	}
+	if hourlySnapshotAvailable {
+		prices = hourlySnapshot.Prices
+	} else {
+		prices, err = s.store.LoadModelPrices(ctx)
+		if err != nil {
+			return Response{}, err
+		}
+	}
 
 	var modelStats []store.ModelStat
+	var channelStats []store.ChannelModelStat
+	var accountStats []store.AccountModelStat
+	var apiKeyStats []store.APIKeyModelStat
+	deriveChannelStatsFromAccounts := req.Include.ChannelShare && req.Include.AccountStats
 	needsModelStats := req.Include.Summary || req.Include.ModelShare || req.Include.ModelStats
 	if needsModelStats {
-		modelStats, err = s.store.ModelStatsWithFilter(ctx, filter, 0)
-		if err != nil {
-			return Response{}, err
-		}
-	}
-
-	var taskBuckets []store.TaskBucket
-	if req.Include.Summary || req.Include.TaskBuckets {
-		taskBuckets, err = s.store.TaskBucketsWithFilter(ctx, filter)
-		if err != nil {
-			return Response{}, err
-		}
-	}
-
-	if req.Include.Summary {
-		agg, err := s.store.AggregateWithFilter(ctx, filter)
-		if err != nil {
-			return Response{}, err
-		}
-		latencySummary, err := s.store.LatencySummaryWithFilter(ctx, filter)
-		if err != nil {
-			return Response{}, err
-		}
-		rollingFilter := filter
-		rollingFilter.FromMS = nowMS - recentWindowMS
-		rollingFilter.ToMS = nowMS
-		rollingAgg, err := s.store.AggregateWithFilter(ctx, rollingFilter)
-		if err != nil {
-			return Response{}, err
-		}
-		activeDays, err := s.store.ActiveDaysWithFilter(ctx, filter, location)
-		if err != nil {
-			return Response{}, err
-		}
-		zeroTokenModels, err := s.store.ZeroTokenModelsWithFilter(ctx, filter)
-		if err != nil {
-			return Response{}, err
-		}
-		response.Summary = buildSummary(agg, latencySummary, rollingAgg, activeDays, modelStats, taskBuckets, prices, zeroTokenModels)
-		summaryTotalCalls = agg.TotalCalls
-		summaryComputed = true
-
-		// Period-over-period comparison reuses the same filter over the
-		// immediately preceding window [FromMS-window, FromMS). Gated behind an
-		// explicit flag so other analytics consumers avoid the extra queries.
-		if req.Include.SummaryComparison {
-			windowMS := req.ToMS - req.FromMS
-			if prevFrom := req.FromMS - windowMS; prevFrom > 0 {
-				prevFilter := filter
-				prevFilter.FromMS = prevFrom
-				prevFilter.ToMS = req.FromMS
-				prevAgg, err := s.store.AggregateWithFilter(ctx, prevFilter)
-				if err != nil {
-					return Response{}, err
-				}
-				prevModelStats, err := s.store.ModelStatsWithFilter(ctx, prevFilter, 0)
-				if err != nil {
-					return Response{}, err
-				}
-				response.SummaryComparison = &SummaryComparison{
-					FromMS:       prevFrom,
-					ToMS:         req.FromMS,
-					TotalCalls:   prevAgg.TotalCalls,
-					SuccessCalls: prevAgg.SuccessCalls,
-					FailureCalls: prevAgg.FailureCalls,
-					SuccessRate:  ratio(prevAgg.SuccessCalls, prevAgg.TotalCalls),
-					TotalTokens:  prevAgg.TotalTokens,
-					TotalCost:    sumCost(prevModelStats, prices),
-				}
+		if hourlySnapshotAvailable {
+			modelStats = hourlySnapshot.ModelStats
+		} else {
+			modelStats, err = s.modelStats(ctx, filter)
+			if err != nil {
+				return Response{}, err
 			}
 		}
 	}
-	var timeline []TimelinePoint
+
+	queries := newAnalyticsQueryGroup(ctx, analyticsPrefetchConcurrency)
+	defer queries.Close()
+
+	var latencyPercentiles []store.LatencyPercentiles
 	if req.Include.Timeline || req.Include.AnomalyPoints {
-		points, err := s.store.TimelineWithFilter(ctx, filter, granularity, location)
-		if err != nil {
-			return Response{}, err
-		}
-		percentiles, err := s.store.LatencyPercentilesWithFilter(ctx, filter, granularity, location)
-		if err != nil {
-			return Response{}, err
-		}
-		timeline = buildTimeline(points, percentiles, granularity, location, prices)
-		if req.Include.Timeline {
-			response.Timeline = timeline
-		}
-		if req.Include.AnomalyPoints {
-			response.AnomalyPoints = buildAnomalyPoints(timeline, granularity)
-		}
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			latencyPercentiles, queryErr = s.store.LatencyPercentilesWithFilter(queryCtx, filter, granularity, location)
+			return queryErr
+		})
 	}
+
+	var hourlyDistributionPoints []store.HourlyPoint
 	if req.Include.HourlyDistribution {
-		points, err := s.store.HourlyDistributionWithFilter(ctx, filter, location)
-		if err != nil {
-			return Response{}, err
-		}
-		response.HourlyDistribution = buildHourly(points)
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			hourlyDistributionPoints, queryErr = s.store.HourlyDistributionWithFilter(queryCtx, filter, location)
+			return queryErr
+		})
 	}
+
+	var heatmapPoints []store.HeatmapPoint
 	if req.Include.Heatmap {
-		points, err := s.store.HeatmapWithFilter(ctx, filter, location)
-		if err != nil {
-			return Response{}, err
-		}
-		response.Heatmap = buildHeatmap(points, prices)
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			heatmapPoints, queryErr = s.store.HeatmapWithFilter(queryCtx, filter, location)
+			return queryErr
+		})
 	}
-	if req.Include.ModelShare {
-		response.ModelShare = buildModelShare(modelStats, prices)
+
+	if req.Include.ChannelShare && !deriveChannelStatsFromAccounts {
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			channelStats, queryErr = s.channelModelStats(queryCtx, filter)
+			return queryErr
+		})
 	}
-	if req.Include.ModelStats {
-		response.ModelStats = buildModelStats(modelStats, prices)
-	}
-	if req.Include.ChannelShare {
-		stats, err := s.store.ChannelModelStatsWithFilter(ctx, filter)
-		if err != nil {
-			return Response{}, err
-		}
-		response.ChannelShare = buildChannelShare(stats, prices)
-	}
+
+	var failureSourceStats []store.FailureSourceStat
 	if req.Include.FailureSources {
-		stats, err := s.store.FailureSourcesWithFilter(ctx, filter)
-		if err != nil {
-			return Response{}, err
-		}
-		response.FailureSources = buildFailureSources(stats)
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			failureSourceStats, queryErr = s.store.FailureSourcesWithFilter(queryCtx, filter)
+			return queryErr
+		})
 	}
+
 	if req.Include.AccountStats {
-		stats, err := s.store.AccountModelStatsWithFilter(ctx, filter)
-		if err != nil {
-			return Response{}, err
-		}
-		response.AccountStats = buildAccountStats(stats, prices)
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			accountStats, queryErr = s.accountModelStats(queryCtx, filter)
+			return queryErr
+		})
 	}
+
+	var credentialStats []store.CredentialModelStat
 	if req.Include.CredentialStats {
-		stats, err := s.store.CredentialModelStatsWithFilter(ctx, filter)
-		if err != nil {
-			return Response{}, err
-		}
-		response.CredentialStats = buildCredentialStats(stats, prices)
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			credentialStats, queryErr = s.store.CredentialModelStatsWithFilter(queryCtx, filter)
+			return queryErr
+		})
 	}
+
+	var credentialTimelinePoints []store.CredentialTimelinePoint
 	if req.Include.CredentialTimeline {
-		points, err := s.store.CredentialTimelineWithFilter(ctx, filter, granularity, location)
-		if err != nil {
-			return Response{}, err
-		}
-		response.CredentialTimeline = buildCredentialTimeline(points, granularity, location, prices)
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			credentialTimelinePoints, queryErr = s.store.CredentialTimelineWithFilter(queryCtx, filter, granularity, location)
+			return queryErr
+		})
 	}
+
+	var apiKeyTimelinePoints []store.APIKeyTimelinePoint
+	if req.Include.APIKeyTimeline {
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			apiKeyTimelinePoints, queryErr = s.store.APIKeyTimelineWithFilter(queryCtx, filter, granularity, location)
+			return queryErr
+		})
+	}
+
 	if req.Include.APIKeyStats {
-		stats, err := s.store.APIKeyModelStatsWithFilter(ctx, filter)
-		if err != nil {
-			return Response{}, err
-		}
-		response.APIKeyStats = buildAPIKeyStats(stats, prices)
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			apiKeyStats, queryErr = s.apiKeyModelStats(queryCtx, filter)
+			return queryErr
+		})
 	}
+
+	var selectorOptions *FilterOptions
+	var prebuiltFilterOptions *FilterOptions
+	var filterOptionValues store.FilterOptionValues
+	var filterOptionValuesAvailable bool
 	if req.Include.FilterSelectors {
-		selectors, err := s.filterSelectors(ctx, filter)
-		if err != nil {
-			return Response{}, err
-		}
-		response.FilterOptions = selectors
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			selectorOptions, queryErr = s.filterSelectors(queryCtx, filter)
+			return queryErr
+		})
 	} else if req.Include.FilterOptions {
-		options, err := s.filterOptions(ctx, filter, prices)
-		if err != nil {
-			return Response{}, err
+		if filterOptionsMatchMainScope(filter) {
+			queries.Go(func(queryCtx context.Context) error {
+				var queryErr error
+				filterOptionValues, queryErr = s.filterOptionValues(queryCtx, filterOptionsBaseFilter(filter))
+				filterOptionValuesAvailable = queryErr == nil
+				return queryErr
+			})
+		} else {
+			queries.Go(func(queryCtx context.Context) error {
+				var queryErr error
+				prebuiltFilterOptions, queryErr = s.filterOptions(queryCtx, filter, prices, filterOptionStats{})
+				return queryErr
+			})
 		}
-		response.FilterOptions = options
 	}
-	if req.Include.TaskBuckets {
-		response.TaskBuckets = buildTaskBuckets(taskBuckets)
-	}
+
+	var recentFailureRows []store.RecentFailure
 	if req.Include.RecentFailures > 0 {
-		failures, err := s.store.RecentFailuresWithFilter(ctx, filter, req.Include.RecentFailures)
-		if err != nil {
-			return Response{}, err
-		}
-		response.RecentFailures = buildRecentFailures(failures)
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			recentFailureRows, queryErr = s.store.RecentFailuresWithFilter(queryCtx, filter, req.Include.RecentFailures)
+			return queryErr
+		})
 	}
+
+	var eventsPage store.EventsPage
 	if req.Include.EventsPage != nil {
 		limit := req.Include.EventsPage.Limit
 		if limit <= 0 {
@@ -840,10 +1089,223 @@ func (s *Service) Analytics(ctx context.Context, req Request) (Response, error) 
 		if req.Include.EventsPage.BeforeID != nil {
 			beforeID = *req.Include.EventsPage.BeforeID
 		}
-		page, err := s.store.EventsPageWithFilter(ctx, filter, beforeMS, beforeID, limit)
+		queries.Go(func(queryCtx context.Context) error {
+			var queryErr error
+			eventsPage, queryErr = s.eventsPage(queryCtx, filter, beforeMS, beforeID, limit)
+			return queryErr
+		})
+	}
+
+	var taskBuckets []store.TaskBucket
+	if req.Include.TaskBuckets || (req.Include.Summary && !compactSummary) {
+		taskBuckets, err = s.store.TaskBucketsWithFilter(ctx, filter)
 		if err != nil {
 			return Response{}, err
 		}
+	}
+
+	if req.Include.Summary {
+		var agg store.Aggregate
+		if hourlySnapshotAvailable {
+			agg = hourlySnapshot.Aggregate
+		} else {
+			agg, err = s.aggregate(ctx, filter)
+			if err != nil {
+				return Response{}, err
+			}
+		}
+		var latencySummary store.LatencySummary
+		if !compactSummary || req.Include.SummaryPercentiles {
+			latencySummary, err = s.store.LatencySummaryWithFilter(ctx, filter)
+			if err != nil {
+				return Response{}, err
+			}
+		}
+		var rollingAgg store.Aggregate
+		var activeDays int64
+		var zeroTokenModels []string
+		if !compactSummary {
+			rollingFilter := filter
+			rollingFilter.FromMS = nowMS - recentWindowMS
+			rollingFilter.ToMS = nowMS
+			rollingAgg, err = s.store.AggregateWithFilter(ctx, rollingFilter)
+			if err != nil {
+				return Response{}, err
+			}
+			activeDays, err = s.store.ActiveDaysWithFilter(ctx, filter, location)
+			if err != nil {
+				return Response{}, err
+			}
+			zeroTokenModels, err = s.store.ZeroTokenModelsWithFilter(ctx, filter)
+			if err != nil {
+				return Response{}, err
+			}
+		}
+		summaryTaskBuckets := taskBuckets
+		if compactSummary {
+			summaryTaskBuckets = nil
+		}
+		response.Summary = buildSummary(agg, latencySummary, rollingAgg, activeDays, modelStats, summaryTaskBuckets, prices, zeroTokenModels)
+		if compactSummary {
+			clearFullSummaryMetrics(response.Summary)
+		}
+		summaryTotalCalls = agg.TotalCalls
+		summaryComputed = true
+
+		// Period-over-period comparison reuses the same filter over the
+		// immediately preceding window [FromMS-window, FromMS). Gated behind an
+		// explicit flag so other analytics consumers avoid the extra queries.
+		if req.Include.SummaryComparison {
+			windowMS := req.ToMS - req.FromMS
+			if prevFrom := req.FromMS - windowMS; prevFrom > 0 {
+				prevFilter := filter
+				prevFilter.FromMS = prevFrom
+				prevFilter.ToMS = req.FromMS
+				var prevAgg store.Aggregate
+				var prevModelStats []store.ModelStat
+				var prevSnapshot usagehourly.Snapshot
+				prevSnapshotAvailable := false
+				if rollupEligible {
+					prevSnapshot, prevSnapshotAvailable = s.hourlyReader.LoadAnalytics(
+						ctx,
+						prevFilter,
+						granularity,
+						location,
+						false,
+					)
+				}
+				if prevSnapshotAvailable {
+					prevAgg = prevSnapshot.Aggregate
+					prevModelStats = prevSnapshot.ModelStats
+				} else {
+					prevAgg, err = s.aggregate(ctx, prevFilter)
+					if err != nil {
+						return Response{}, err
+					}
+					prevModelStats, err = s.modelStats(ctx, prevFilter)
+					if err != nil {
+						return Response{}, err
+					}
+				}
+				response.SummaryComparison = &SummaryComparison{
+					FromMS:       prevFrom,
+					ToMS:         req.FromMS,
+					TotalCalls:   prevAgg.TotalCalls,
+					SuccessCalls: prevAgg.SuccessCalls,
+					FailureCalls: prevAgg.FailureCalls,
+					SuccessRate:  ratio(prevAgg.SuccessCalls, prevAgg.TotalCalls),
+					TotalTokens:  prevAgg.TotalTokens,
+					TotalCost:    sumCost(prevModelStats, prices),
+				}
+			}
+		}
+	}
+	if err := queries.Wait(); err != nil {
+		return Response{}, err
+	}
+	if deriveChannelStatsFromAccounts {
+		channelStats = channelModelStatsFromAccountStats(accountStats)
+	}
+	var timeline []TimelinePoint
+	if req.Include.Timeline || req.Include.AnomalyPoints {
+		var points []store.TimelinePoint
+		pointsAvailable := false
+		if hourlySnapshotAvailable && hourlyTimelineRepresentable {
+			points, pointsAvailable = s.hourlyReader.AnalyticsTimeline(ctx, hourlySnapshot, granularity, location)
+		}
+		if !pointsAvailable {
+			points, err = s.store.TimelineWithFilter(ctx, filter, granularity, location)
+			if err != nil {
+				return Response{}, err
+			}
+		}
+		timeline = buildTimeline(points, latencyPercentiles, granularity, location, prices)
+		if req.Include.Timeline {
+			response.Timeline = timeline
+		}
+		if req.Include.AnomalyPoints {
+			response.AnomalyPoints = buildAnomalyPoints(timeline, granularity)
+		}
+	}
+	if req.Include.HourlyDistribution {
+		response.HourlyDistribution = buildHourly(hourlyDistributionPoints)
+	}
+	if req.Include.Heatmap {
+		response.Heatmap = buildHeatmap(heatmapPoints, prices)
+	}
+	if req.Include.ModelShare {
+		response.ModelShare = buildModelShare(modelStats, prices)
+	}
+	if req.Include.ModelStats {
+		response.ModelStats = buildModelStats(modelStats, prices)
+	}
+	if req.Include.ChannelShare {
+		response.ChannelShare = buildChannelShare(channelStats, prices)
+	}
+	if req.Include.FailureSources {
+		response.FailureSources = buildFailureSources(failureSourceStats)
+	}
+	if req.Include.AccountStats {
+		response.AccountStats = buildAccountStats(accountStats, prices)
+	}
+	if req.Include.CredentialStats {
+		response.CredentialStats = buildCredentialStats(credentialStats, prices)
+	}
+	if req.Include.CredentialTimeline {
+		response.CredentialTimeline = buildCredentialTimeline(credentialTimelinePoints, granularity, location, prices)
+	}
+	if req.Include.APIKeyTimeline {
+		response.APIKeyTimeline = buildAPIKeyTimeline(apiKeyTimelinePoints, granularity, location, prices)
+	}
+	if req.Include.APIKeyStats {
+		response.APIKeyStats = buildAPIKeyStats(apiKeyStats, prices)
+	}
+	if req.Include.FilterSelectors {
+		response.FilterOptions = selectorOptions
+	} else if req.Include.FilterOptions {
+		if prebuiltFilterOptions != nil {
+			response.FilterOptions = prebuiltFilterOptions
+		} else {
+			reuse := filterOptionStats{
+				accountStats:          accountStats,
+				accountStatsAvailable: req.Include.AccountStats,
+				apiKeyStats:           apiKeyStats,
+				apiKeyStatsAvailable:  req.Include.APIKeyStats,
+				channelStats:          channelStats,
+				channelStatsAvailable: req.Include.ChannelShare,
+				modelStats:            modelStats,
+				modelStatsAvailable:   needsModelStats,
+				optionValues:          filterOptionValues,
+				optionValuesAvailable: filterOptionValuesAvailable,
+			}
+			options, err := s.filterOptions(ctx, filter, prices, reuse)
+			if err != nil {
+				return Response{}, err
+			}
+			if filterOptionsMatchMainScope(filter) {
+				if req.Include.AccountStats {
+					options.AccountStats = response.AccountStats
+				}
+				if req.Include.APIKeyStats {
+					options.APIKeyStats = response.APIKeyStats
+				}
+				if req.Include.ChannelShare {
+					options.ChannelShare = response.ChannelShare
+				}
+				if req.Include.ModelStats {
+					options.ModelStats = response.ModelStats
+				}
+			}
+			response.FilterOptions = options
+		}
+	}
+	if req.Include.TaskBuckets {
+		response.TaskBuckets = buildTaskBuckets(taskBuckets)
+	}
+	if req.Include.RecentFailures > 0 {
+		response.RecentFailures = buildRecentFailures(recentFailureRows)
+	}
+	if req.Include.EventsPage != nil {
 		// total_count is the real number of events matching the current filter
 		// (time range + scope filters + search), independent of the pagination
 		// cursor. Reuse the summary aggregate count when it was already computed
@@ -851,12 +1313,12 @@ func (s *Service) Analytics(ctx context.Context, req Request) (Response, error) 
 		// lightweight count(*).
 		total := summaryTotalCalls
 		if !summaryComputed {
-			total, err = s.store.EventsCountWithFilter(ctx, filter)
+			total, err = s.eventsCount(ctx, filter)
 			if err != nil {
 				return Response{}, err
 			}
 		}
-		response.Events = buildEvents(page, total)
+		response.Events = buildEvents(eventsPage, total)
 	}
 	if req.Include.DrilldownPreview != nil {
 		preview := req.Include.DrilldownPreview
@@ -871,7 +1333,7 @@ func (s *Service) Analytics(ctx context.Context, req Request) (Response, error) 
 			if limit > maxDrilldownLimit {
 				limit = maxDrilldownLimit
 			}
-			page, err := s.store.EventsPageWithFilter(ctx, previewFilter, 0, 0, limit)
+			page, err := s.eventsPage(ctx, previewFilter, 0, 0, limit)
 			if err != nil {
 				return Response{}, err
 			}
@@ -883,11 +1345,26 @@ func (s *Service) Analytics(ctx context.Context, req Request) (Response, error) 
 }
 
 func (s *Service) AccountHistory(ctx context.Context, req AccountHistoryRequest) (AccountHistoryResponse, error) {
+	var response AccountHistoryResponse
+	err := s.store.WithModelPriceSnapshot(func() error {
+		var historyErr error
+		response, historyErr = s.accountHistory(ctx, req)
+		return historyErr
+	})
+	return response, err
+}
+
+func (s *Service) accountHistory(ctx context.Context, req AccountHistoryRequest) (AccountHistoryResponse, error) {
 	if len(req.Accounts) == 0 {
 		return AccountHistoryResponse{}, errors.New("accounts are required")
 	}
 	if len(req.Accounts) > maxAccountHistoryTargets {
 		return AccountHistoryResponse{}, fmt.Errorf("accounts must be less than or equal to %d", maxAccountHistoryTargets)
+	}
+	for _, account := range req.Accounts {
+		if !AccountHistoryTargetHasRequiredProvider(account) {
+			return AccountHistoryResponse{}, errors.New("auth_provider_snapshot is required for file account targets")
+		}
 	}
 	generatedAtMS := time.Now().UnixMilli()
 	processed := 0
@@ -897,6 +1374,9 @@ func (s *Service) AccountHistory(ctx context.Context, req AccountHistoryRequest)
 			return AccountHistoryResponse{}, err
 		}
 		processed = result.Processed
+		if _, err := s.store.CatchUpUsagePricing(ctx, accountHistoryCatchUpLimit, generatedAtMS); err != nil {
+			return AccountHistoryResponse{}, err
+		}
 	}
 	checkpoint, err := s.store.AccountHistoryRollupCheckpoint(ctx)
 	if err != nil {
@@ -910,6 +1390,7 @@ func (s *Service) AccountHistory(ctx context.Context, req AccountHistoryRequest)
 	keys := make([]string, 0, len(req.Accounts))
 	targetKeys := make([]string, len(req.Accounts))
 	validTargets := make([]bool, len(req.Accounts))
+	latestRequestTargets := make([]store.LatestAccountRequestQuery, 0, len(req.Accounts))
 	for index, account := range req.Accounts {
 		key, valid := accountHistoryTargetKey(account)
 		targetKeys[index] = key
@@ -917,34 +1398,78 @@ func (s *Service) AccountHistory(ctx context.Context, req AccountHistoryRequest)
 		if valid {
 			keys = append(keys, key)
 		}
+		if latestAccountRequestTargetValid(account) {
+			latestRequestTargets = append(latestRequestTargets, store.LatestAccountRequestQuery{
+				RequestIndex:     index,
+				AuthFileSnapshot: accountHistoryAuthFileSnapshot(account),
+				AuthIndex:        account.AuthIndex,
+			})
+		}
 	}
-	rows, err := s.store.AccountHistoryRollupRows(ctx, keys)
+	pricingSnapshot, err := s.store.LoadUsagePricingAccountSnapshot(ctx, keys)
 	if err != nil {
 		return AccountHistoryResponse{}, err
 	}
-	prices, err := s.store.LoadModelPrices(ctx)
+	prices := pricingSnapshot.Prices
+	var totals map[string]*accountHistoryTotal
+	if pricingSnapshot.Available {
+		totals = buildPricingAccountHistoryTotals(pricingSnapshot.Rows, prices)
+	} else {
+		rows, err := s.store.AccountHistoryRollupRows(ctx, keys)
+		if err != nil {
+			return AccountHistoryResponse{}, err
+		}
+		totals = buildAccountHistoryTotals(rows, prices)
+	}
+	recentRequests, err := s.store.RecentAccountRequests(
+		ctx,
+		latestRequestTargets,
+		accountRecentRequestLimit,
+	)
 	if err != nil {
 		return AccountHistoryResponse{}, err
 	}
-	totals := buildAccountHistoryTotals(rows, prices)
+	recentRequestsByTargetIndex := make(map[int][]AccountLatestRequest, len(recentRequests))
+	for _, request := range recentRequests {
+		mapped := accountLatestRequestFromStore(request)
+		if mapped == nil {
+			continue
+		}
+		recentRequestsByTargetIndex[request.RequestIndex] = append(
+			recentRequestsByTargetIndex[request.RequestIndex],
+			*mapped,
+		)
+	}
 	pending := latestID > checkpoint.LastEventID
 	items := make([]AccountHistoryItem, 0, len(req.Accounts))
 	for index := range req.Accounts {
 		key := targetKeys[index]
+		targetRecentRequests := recentRequestsByTargetIndex[index]
+		var latestRequest *AccountLatestRequest
+		if len(targetRecentRequests) > 0 {
+			value := targetRecentRequests[0]
+			latestRequest = &value
+		}
 		if !validTargets[index] {
 			items = append(items, AccountHistoryItem{
-				AccountKey: key,
-				Matched:    false,
-				SyncStatus: accountHistorySyncStatus(false, false),
+				RowKey:         req.Accounts[index].RowKey,
+				AccountKey:     key,
+				Matched:        false,
+				LatestRequest:  latestRequest,
+				RecentRequests: targetRecentRequests,
+				SyncStatus:     accountHistorySyncStatus(false, false),
 			})
 			continue
 		}
 		total := totals[key]
 		if total == nil {
 			items = append(items, AccountHistoryItem{
-				AccountKey: key,
-				Matched:    false,
-				SyncStatus: accountHistorySyncStatus(false, pending),
+				RowKey:         req.Accounts[index].RowKey,
+				AccountKey:     key,
+				Matched:        false,
+				LatestRequest:  latestRequest,
+				RecentRequests: targetRecentRequests,
+				SyncStatus:     accountHistorySyncStatus(false, pending),
 			})
 			continue
 		}
@@ -954,17 +1479,20 @@ func (s *Service) AccountHistory(ctx context.Context, req AccountHistoryRequest)
 			successRate = &value
 		}
 		items = append(items, AccountHistoryItem{
-			AccountKey:    key,
-			Matched:       true,
-			TotalRequests: total.requests,
-			SuccessCalls:  total.successCalls,
-			FailureCalls:  total.failureCalls,
-			TotalTokens:   total.totalTokens,
-			TotalCost:     total.cost,
-			SuccessRate:   successRate,
-			FirstSeenMS:   nullableMSPointer(total.firstSeenMS),
-			LastSeenMS:    nullableMSPointer(total.lastSeenMS),
-			SyncStatus:    accountHistorySyncStatus(true, pending),
+			RowKey:         req.Accounts[index].RowKey,
+			AccountKey:     key,
+			Matched:        true,
+			TotalRequests:  total.requests,
+			SuccessCalls:   total.successCalls,
+			FailureCalls:   total.failureCalls,
+			TotalTokens:    total.totalTokens,
+			TotalCost:      total.cost,
+			SuccessRate:    successRate,
+			FirstSeenMS:    nullableMSPointer(total.firstSeenMS),
+			LastSeenMS:     nullableMSPointer(total.lastSeenMS),
+			LatestRequest:  latestRequest,
+			RecentRequests: targetRecentRequests,
+			SyncStatus:     accountHistorySyncStatus(true, pending),
 		})
 	}
 
@@ -977,6 +1505,143 @@ func (s *Service) AccountHistory(ctx context.Context, req AccountHistoryRequest)
 			Processed:   processed,
 		},
 		Items: items,
+	}, nil
+}
+
+func (s *Service) AccountWindowUsage(ctx context.Context, req AccountWindowUsageRequest) (AccountWindowUsageResponse, error) {
+	var response AccountWindowUsageResponse
+	err := s.store.WithModelPriceSnapshot(func() error {
+		var usageErr error
+		response, usageErr = s.accountWindowUsage(ctx, req)
+		return usageErr
+	})
+	return response, err
+}
+
+func (s *Service) accountWindowUsage(ctx context.Context, req AccountWindowUsageRequest) (AccountWindowUsageResponse, error) {
+	if len(req.Windows) == 0 {
+		return AccountWindowUsageResponse{}, errors.New("windows are required")
+	}
+	if len(req.Windows) > maxAccountWindowUsageItems {
+		return AccountWindowUsageResponse{}, fmt.Errorf("windows must be less than or equal to %d", maxAccountWindowUsageItems)
+	}
+
+	queries := make([]store.AccountWindowUsageQuery, 0, len(req.Windows))
+	for index := range req.Windows {
+		window := &req.Windows[index]
+		if strings.TrimSpace(window.RowKey) == "" {
+			return AccountWindowUsageResponse{}, errors.New("row_key is required")
+		}
+		window.ProviderWindowID = strings.TrimSpace(window.ProviderWindowID)
+		if window.ProviderWindowID == "" {
+			window.ProviderWindowID = strings.TrimSpace(window.WindowKey)
+		}
+		if window.ProviderWindowID == "" {
+			return AccountWindowUsageResponse{}, errors.New("provider_window_id is required")
+		}
+		window.Period = normalizeAccountWindowPeriod(window.Period)
+		if window.Period == "" {
+			return AccountWindowUsageResponse{}, errors.New("period must be current, previous, or previous_equal_range")
+		}
+		modelScopeProvided := window.ModelScopeProvided ||
+			strings.TrimSpace(window.ModelScope.Kind) != "" ||
+			strings.TrimSpace(window.ModelScope.Key) != "" ||
+			len(window.ModelScope.Models) > 0 || window.ModelScope.Complete
+		modelScopeCompleteSet := window.ModelScopeCompleteSet || window.ModelScope.Complete
+		window.ModelScope = normalizeAccountWindowModelScope(
+			window.ModelScope,
+			modelScopeProvided,
+			modelScopeCompleteSet,
+		)
+		if window.ModelScope.Kind == "" {
+			return AccountWindowUsageResponse{}, errors.New("model_scope is invalid")
+		}
+		if window.RequestKey = strings.TrimSpace(window.RequestKey); window.RequestKey == "" {
+			window.RequestKey = strings.Join([]string{window.RowKey, window.ProviderWindowID, window.ModelScope.Key, window.Period}, "\x00")
+		}
+		if window.FromMS <= 0 || window.ToMS <= 0 || window.FromMS >= window.ToMS {
+			return AccountWindowUsageResponse{}, errors.New("from_ms and to_ms are required and from_ms must be less than to_ms")
+		}
+		if !AccountWindowUsageTargetHasRequiredProvider(*window) {
+			return AccountWindowUsageResponse{}, errors.New("auth_provider_snapshot is required for file account targets")
+		}
+		accountKey, valid := accountWindowUsageTargetKey(*window)
+		if !valid {
+			return AccountWindowUsageResponse{}, errors.New("account target credential identity is required")
+		}
+		queries = append(queries, store.AccountWindowUsageQuery{
+			RequestIndex:          index,
+			FromMS:                window.FromMS,
+			ToMS:                  window.ToMS,
+			AccountKey:            accountKey,
+			AccountSnapshot:       window.AccountSnapshot,
+			AuthLabelSnapshot:     window.AuthLabelSnapshot,
+			AuthFileSnapshot:      window.AuthFileSnapshot,
+			AuthProviderSnapshot:  window.AuthProviderSnapshot,
+			AuthProjectIDSnapshot: window.AuthProjectIDSnapshot,
+			Source:                window.Source,
+			AuthIndex:             window.AuthIndex,
+		})
+	}
+
+	stats, available := s.monitoringReader.AccountWindowStats(ctx, queries)
+	if !available {
+		var err error
+		stats, err = s.store.AccountWindowModelStats(ctx, queries)
+		if err != nil {
+			return AccountWindowUsageResponse{}, err
+		}
+	}
+	prices, err := s.store.LoadModelPrices(ctx)
+	if err != nil {
+		return AccountWindowUsageResponse{}, err
+	}
+
+	totals, scopeResults := buildScopedAccountWindowUsageTotals(stats, req.Windows, prices)
+	items := make([]AccountWindowUsageItem, 0, len(req.Windows))
+	for index, window := range req.Windows {
+		total := totals[index]
+		if total == nil {
+			items = append(items, AccountWindowUsageItem{
+				RequestKey: window.RequestKey, RowKey: window.RowKey,
+				WindowKey: window.WindowKey, ProviderWindowID: window.ProviderWindowID,
+				Period: window.Period, FromMS: window.FromMS, ToMS: window.ToMS,
+				Matched: false, SyncStatus: "empty",
+				ScopeMatchStatus:  scopeResults[index].status,
+				UnmatchedRequests: scopeResults[index].unmatchedRequests,
+			})
+			continue
+		}
+		var successRate *float64
+		if total.requests > 0 {
+			value := ratio(total.successCalls, total.requests)
+			successRate = &value
+		}
+		items = append(items, AccountWindowUsageItem{
+			RequestKey:        window.RequestKey,
+			RowKey:            window.RowKey,
+			WindowKey:         window.WindowKey,
+			ProviderWindowID:  window.ProviderWindowID,
+			Period:            window.Period,
+			FromMS:            window.FromMS,
+			ToMS:              window.ToMS,
+			Matched:           true,
+			TotalRequests:     total.requests,
+			SuccessCalls:      total.successCalls,
+			FailureCalls:      total.failureCalls,
+			TotalTokens:       total.totalTokens,
+			TotalCost:         total.cost,
+			SuccessRate:       successRate,
+			LastSeenMS:        nullableMSPointer(total.lastSeenMS),
+			SyncStatus:        "ready",
+			ScopeMatchStatus:  scopeResults[index].status,
+			UnmatchedRequests: scopeResults[index].unmatchedRequests,
+		})
+	}
+
+	return AccountWindowUsageResponse{
+		GeneratedAtMS: time.Now().UnixMilli(),
+		Items:         items,
 	}, nil
 }
 
@@ -997,9 +1662,13 @@ func (s *Service) HeaderSnapshots(ctx context.Context, req HeaderSnapshotsReques
 	}
 	nowMS := time.Now().UnixMilli()
 	fromMS := nowMS - int64(days)*24*60*60*1000
-	items, err := s.store.LatestHeaderSnapshots(ctx, fromMS, limit)
-	if err != nil {
-		return HeaderSnapshotsResponse{}, err
+	items, available := s.monitoringReader.HeaderSnapshots(ctx, fromMS, limit)
+	if !available {
+		var err error
+		items, err = s.store.LatestHeaderSnapshots(ctx, fromMS, limit)
+		if err != nil {
+			return HeaderSnapshotsResponse{}, err
+		}
 	}
 	return HeaderSnapshotsResponse{
 		GeneratedAtMS: nowMS,
@@ -1022,6 +1691,7 @@ func buildFilter(req Request) store.AnalyticsFilter {
 		Models:           req.Filters.Models,
 		Providers:        req.Filters.Providers,
 		Accounts:         req.Filters.Accounts,
+		CredentialIDs:    req.Filters.CredentialIDs,
 		AuthFiles:        req.Filters.AuthFiles,
 		AuthIndices:      req.Filters.AuthIndices,
 		APIKeyHashes:     req.Filters.APIKeyHashes,
@@ -1039,28 +1709,66 @@ func buildFilter(req Request) store.AnalyticsFilter {
 	}
 }
 
-func (s *Service) filterOptions(ctx context.Context, filter store.AnalyticsFilter, prices map[string]store.ModelPrice) (*FilterOptions, error) {
+func analyticsHourlyRollupEligible(filter store.AnalyticsFilter) bool {
+	return usagehourly.SupportsAnalyticsFilter(filter)
+}
+
+type filterOptionStats struct {
+	accountStats          []store.AccountModelStat
+	accountStatsAvailable bool
+	apiKeyStats           []store.APIKeyModelStat
+	apiKeyStatsAvailable  bool
+	channelStats          []store.ChannelModelStat
+	channelStatsAvailable bool
+	modelStats            []store.ModelStat
+	modelStatsAvailable   bool
+	optionValues          store.FilterOptionValues
+	optionValuesAvailable bool
+}
+
+func (s *Service) filterOptions(
+	ctx context.Context,
+	filter store.AnalyticsFilter,
+	prices map[string]store.ModelPrice,
+	reuse filterOptionStats,
+) (*FilterOptions, error) {
 	optionFilter := filterOptionsBaseFilter(filter)
 
-	accountStats, err := s.store.AccountModelStatsWithFilter(ctx, optionFilter)
-	if err != nil {
-		return nil, err
+	accountStats := reuse.accountStats
+	if !reuse.accountStatsAvailable {
+		var err error
+		accountStats, err = s.accountModelStats(ctx, optionFilter)
+		if err != nil {
+			return nil, err
+		}
 	}
-	apiKeyStats, err := s.store.APIKeyModelStatsWithFilter(ctx, optionFilter)
-	if err != nil {
-		return nil, err
+	apiKeyStats := reuse.apiKeyStats
+	if !reuse.apiKeyStatsAvailable {
+		var err error
+		apiKeyStats, err = s.apiKeyModelStats(ctx, optionFilter)
+		if err != nil {
+			return nil, err
+		}
 	}
-	channelStats, err := s.store.ChannelModelStatsWithFilter(ctx, optionFilter)
-	if err != nil {
-		return nil, err
+	channelStats := reuse.channelStats
+	if !reuse.channelStatsAvailable {
+		channelStats = channelModelStatsFromAccountStats(accountStats)
 	}
-	modelStats, err := s.store.ModelStatsWithFilter(ctx, optionFilter, 0)
-	if err != nil {
-		return nil, err
+	modelStats := reuse.modelStats
+	if !reuse.modelStatsAvailable {
+		var err error
+		modelStats, err = s.modelStats(ctx, optionFilter)
+		if err != nil {
+			return nil, err
+		}
 	}
-	optionValues, err := s.store.FilterOptionValuesWithFilter(ctx, optionFilter)
-	if err != nil {
-		return nil, err
+	optionValues := reuse.optionValues
+	if !reuse.optionValuesAvailable {
+		var err error
+		optionValues, err = s.filterOptionValues(ctx, optionFilter)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &FilterOptions{
@@ -1079,17 +1787,283 @@ func (s *Service) filterOptions(ctx context.Context, filter store.AnalyticsFilte
 	}, nil
 }
 
+func filterOptionsMatchMainScope(filter store.AnalyticsFilter) bool {
+	return len(filter.Models) == 0 &&
+		len(filter.Providers) == 0 &&
+		len(filter.Accounts) == 0 &&
+		len(filter.CredentialIDs) == 0 &&
+		len(filter.AuthFiles) == 0 &&
+		len(filter.AuthIndices) == 0 &&
+		len(filter.APIKeyHashes) == 0 &&
+		len(filter.SourceHashes) == 0 &&
+		len(filter.ProjectIDs) == 0 &&
+		len(filter.RequestTypes) == 0 &&
+		len(filter.HeaderErrorKinds) == 0 &&
+		len(filter.HeaderErrorCodes) == 0 &&
+		len(filter.HeaderQuotaPlans) == 0 &&
+		len(filter.HeaderTraceIDs) == 0 &&
+		filter.IncludeFailed &&
+		!filter.FailedOnly &&
+		filter.MinLatencyMS == 0 &&
+		strings.TrimSpace(filter.CacheStatus) == ""
+}
+
 func (s *Service) filterSelectors(ctx context.Context, filter store.AnalyticsFilter) (*FilterOptions, error) {
-	values, err := s.store.FilterSelectorValuesWithFilter(ctx, filterOptionsBaseFilter(filter))
-	if err != nil {
-		return nil, err
+	optionFilter := filterOptionsBaseFilter(filter)
+	values, available := s.monitoringReader.FilterSelectors(ctx, optionFilter)
+	if !available {
+		var err error
+		values, err = s.store.FilterSelectorValuesWithFilter(ctx, optionFilter)
+		if err != nil {
+			return nil, err
+		}
 	}
+	accountStats := buildAccountSelectorStats(values)
 	return &FilterOptions{
 		Models:       values.Models,
 		APIKeyHashes: values.APIKeyHashes,
 		Providers:    values.Providers,
 		AuthFiles:    values.AuthFiles,
+		Accounts:     values.Accounts,
+		AccountStats: accountStats,
+		AccountCount: len(accountStats),
+		APIKeyCount:  countAPIKeySelectors(values),
 	}, nil
+}
+
+func (s *Service) filterOptionValues(ctx context.Context, filter store.AnalyticsFilter) (store.FilterOptionValues, error) {
+	if values, available := s.monitoringReader.FilterOptions(ctx, filter); available {
+		return values, nil
+	}
+	return s.store.FilterOptionValuesWithFilter(ctx, filter)
+}
+
+func (s *Service) accountModelStats(ctx context.Context, filter store.AnalyticsFilter) ([]store.AccountModelStat, error) {
+	if rows, available := s.monitoringReader.AccountStats(ctx, filter); available {
+		return rows, nil
+	}
+	return s.store.AccountModelStatsWithFilter(ctx, filter)
+}
+
+func (s *Service) apiKeyModelStats(ctx context.Context, filter store.AnalyticsFilter) ([]store.APIKeyModelStat, error) {
+	if rows, available := s.monitoringReader.APIKeyStats(ctx, filter); available {
+		return rows, nil
+	}
+	return s.store.APIKeyModelStatsWithFilter(ctx, filter)
+}
+
+func (s *Service) channelModelStats(ctx context.Context, filter store.AnalyticsFilter) ([]store.ChannelModelStat, error) {
+	if rows, available := s.monitoringReader.AccountStats(ctx, filter); available {
+		return channelModelStatsFromAccountStats(rows), nil
+	}
+	return s.store.ChannelModelStatsWithFilter(ctx, filter)
+}
+
+type channelModelStatKey struct {
+	authIndex        string
+	model            string
+	billingModel     string
+	pricingModel     string
+	contextThreshold int64
+	serviceTier      string
+}
+
+type channelModelStatAccumulator struct {
+	row                          store.ChannelModelStat
+	provider                     string
+	explicitAuthProviderSnapshot string
+	latencySumMS                 int64
+}
+
+func channelModelStatsFromAccountStats(stats []store.AccountModelStat) []store.ChannelModelStat {
+	grouped := make(map[channelModelStatKey]*channelModelStatAccumulator)
+	for _, stat := range stats {
+		key := channelModelStatKey{
+			authIndex:        stat.AuthIndex,
+			model:            stat.Model,
+			billingModel:     stat.BillingModel,
+			pricingModel:     stat.PricingModel,
+			contextThreshold: stat.ContextThresholdTokens,
+			serviceTier:      stat.ServiceTier,
+		}
+		entry := grouped[key]
+		if entry == nil {
+			entry = &channelModelStatAccumulator{
+				row: store.ChannelModelStat{
+					PricingBand:  pricingBandFromAccountStat(stat),
+					AuthIndex:    stat.AuthIndex,
+					Model:        stat.Model,
+					BillingModel: stat.BillingModel,
+					ServiceTier:  stat.ServiceTier,
+				},
+			}
+			grouped[key] = entry
+		}
+		if stat.Source > entry.row.Source {
+			entry.row.Source = stat.Source
+		}
+		if stat.AccountSnapshot > entry.row.AccountSnapshot {
+			entry.row.AccountSnapshot = stat.AccountSnapshot
+		}
+		if stat.AuthLabelSnapshot > entry.row.AuthLabelSnapshot {
+			entry.row.AuthLabelSnapshot = stat.AuthLabelSnapshot
+		}
+		if stat.Provider > entry.provider {
+			entry.provider = stat.Provider
+		}
+		if stat.ExplicitAuthProviderSnapshot > entry.explicitAuthProviderSnapshot {
+			entry.explicitAuthProviderSnapshot = stat.ExplicitAuthProviderSnapshot
+		}
+		entry.row.Calls += stat.Calls
+		entry.row.SuccessCalls += stat.SuccessCalls
+		entry.row.FailureCalls += stat.FailureCalls
+		entry.row.InputTokens += stat.InputTokens
+		entry.row.OutputTokens += stat.OutputTokens
+		entry.row.CachedTokens += stat.CachedTokens
+		entry.row.CacheReadTokens += stat.CacheReadTokens
+		entry.row.CacheCreationTokens += stat.CacheCreationTokens
+		entry.row.LongInputTokens += stat.LongInputTokens
+		entry.row.LongOutputTokens += stat.LongOutputTokens
+		entry.row.LongCachedTokens += stat.LongCachedTokens
+		entry.row.LongCacheReadTokens += stat.LongCacheReadTokens
+		entry.row.LongCacheCreationTokens += stat.LongCacheCreationTokens
+		entry.row.TotalTokens += stat.TotalTokens
+		if stat.LatencySamples > 0 {
+			entry.latencySumMS += stat.LatencySumMS
+			entry.row.LatencySamples += stat.LatencySamples
+		}
+	}
+
+	result := make([]store.ChannelModelStat, 0, len(grouped))
+	for _, entry := range grouped {
+		entry.row.AuthProviderSnapshot = entry.explicitAuthProviderSnapshot
+		if entry.row.AuthProviderSnapshot == "" {
+			entry.row.AuthProviderSnapshot = entry.provider
+		}
+		if entry.row.LatencySamples > 0 {
+			entry.row.AvgLatencyMS.Valid = true
+			entry.row.AvgLatencyMS.Float64 = float64(entry.latencySumMS) / float64(entry.row.LatencySamples)
+		}
+		result = append(result, entry.row)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Calls != result[j].Calls {
+			return result[i].Calls > result[j].Calls
+		}
+		left := result[i]
+		right := result[j]
+		return strings.Join([]string{left.AuthIndex, left.Model, left.BillingModel, left.PricingModel, left.ServiceTier}, "\x00") <
+			strings.Join([]string{right.AuthIndex, right.Model, right.BillingModel, right.PricingModel, right.ServiceTier}, "\x00")
+	})
+	return result
+}
+
+func pricingBandFromAccountStat(stat store.AccountModelStat) usage.PricingBand {
+	return usage.PricingBand{
+		PricingModel:           stat.PricingModel,
+		ContextThresholdTokens: stat.ContextThresholdTokens,
+	}
+}
+
+func (s *Service) aggregate(ctx context.Context, filter store.AnalyticsFilter) (store.Aggregate, error) {
+	if aggregate, available := s.monitoringReader.Aggregate(ctx, filter); available {
+		return aggregate, nil
+	}
+	return s.store.AggregateWithFilter(ctx, filter)
+}
+
+func (s *Service) modelStats(ctx context.Context, filter store.AnalyticsFilter) ([]store.ModelStat, error) {
+	if rows, available := s.monitoringReader.ModelStats(ctx, filter); available {
+		return rows, nil
+	}
+	return s.store.ModelStatsWithFilter(ctx, filter, 0)
+}
+
+func (s *Service) eventsCount(ctx context.Context, filter store.AnalyticsFilter) (int64, error) {
+	if monitoringrollup.SupportsStatsFilter(filter) && monitoringrollup.PrefersEventProjection(filter) {
+		aggregate, err := s.aggregate(ctx, filter)
+		if err != nil {
+			return 0, err
+		}
+		return aggregate.TotalCalls, nil
+	}
+	if total, available := s.monitoringReader.EventsCount(ctx, filter); available {
+		return total, nil
+	}
+	return s.store.EventsCountWithFilter(ctx, filter)
+}
+
+func (s *Service) eventsPage(ctx context.Context, filter store.AnalyticsFilter, beforeMS, beforeID int64, limit int) (store.EventsPage, error) {
+	if page, available := s.monitoringReader.EventsPage(ctx, filter, beforeMS, beforeID, limit); available {
+		return page, nil
+	}
+	return s.store.EventsPageWithFilter(ctx, filter, beforeMS, beforeID, limit)
+}
+
+func countAPIKeySelectors(values store.FilterSelectorValues) int {
+	groups := make(map[string]struct{}, len(values.APIKeySelectors))
+	for _, selector := range values.APIKeySelectors {
+		groups[apiKeyGroupKey(
+			selector.APIKeyHash,
+			selector.SourceHash,
+			selector.AuthIndex,
+			selector.Source,
+			selector.AuthProviderSnapshot,
+		)] = struct{}{}
+	}
+	return len(groups)
+}
+
+func buildAccountSelectorStats(values store.FilterSelectorValues) []AccountStatRow {
+	grouped := map[string]*accountStatAccumulator{}
+	for _, selector := range values.AccountSelectors {
+		id := accountGroupKey(
+			selector.AccountSnapshot,
+			selector.AuthLabelSnapshot,
+			selector.Source,
+			selector.AuthIndex,
+		)
+		if id == "-" && strings.TrimSpace(selector.SourceHash) == "" {
+			continue
+		}
+		entry := grouped[id]
+		if entry == nil {
+			entry = &accountStatAccumulator{
+				row: AccountStatRow{
+					ID:                   id,
+					AccountSnapshot:      selector.AccountSnapshot,
+					AuthLabelSnapshot:    selector.AuthLabelSnapshot,
+					AuthProviderSnapshot: selector.AuthProviderSnapshot,
+					SuccessRate:          1,
+				},
+				authIndices:  map[string]struct{}{},
+				sources:      map[string]struct{}{},
+				sourceHashes: map[string]struct{}{},
+			}
+			grouped[id] = entry
+		}
+		fillAccountStatSnapshots(
+			&entry.row,
+			selector.AccountSnapshot,
+			selector.AuthLabelSnapshot,
+			selector.AuthProviderSnapshot,
+		)
+		addSetValue(entry.authIndices, selector.AuthIndex)
+		addSetValue(entry.sources, selector.Source)
+		addSetValue(entry.sourceHashes, selector.SourceHash)
+	}
+
+	result := make([]AccountStatRow, 0, len(grouped))
+	for _, entry := range grouped {
+		entry.row.AuthIndices = sortedSetValues(entry.authIndices)
+		entry.row.Sources = sortedSetValues(entry.sources)
+		entry.row.SourceHashes = sortedSetValues(entry.sourceHashes)
+		result = append(result, entry.row)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].ID < result[j].ID
+	})
+	return result
 }
 
 func filterOptionsBaseFilter(filter store.AnalyticsFilter) store.AnalyticsFilter {
@@ -1097,6 +2071,7 @@ func filterOptionsBaseFilter(filter store.AnalyticsFilter) store.AnalyticsFilter
 	optionFilter.Models = nil
 	optionFilter.Providers = nil
 	optionFilter.Accounts = nil
+	optionFilter.CredentialIDs = nil
 	optionFilter.AuthFiles = nil
 	optionFilter.AuthIndices = nil
 	optionFilter.APIKeyHashes = nil
@@ -1159,6 +2134,7 @@ func buildSummary(agg store.Aggregate, latencySummary store.LatencySummary, roll
 		CachedTokens:          agg.CachedTokens,
 		CacheReadTokens:       agg.CacheReadTokens,
 		CacheCreationTokens:   agg.CacheCreationTokens,
+		CacheHitRate:          cacheHitRateForModelStats(modelStats),
 		ReasoningTokens:       agg.ReasoningTokens,
 		TotalTokens:           agg.TotalTokens,
 		TotalCost:             totalCost,
@@ -1178,15 +2154,45 @@ func buildSummary(agg store.Aggregate, latencySummary store.LatencySummary, roll
 	}
 }
 
+func clearFullSummaryMetrics(summary *Summary) {
+	if summary == nil {
+		return
+	}
+	summary.RPM30M = 0
+	summary.TPM30M = 0
+	summary.AvgDailyRequests = 0
+	summary.AvgDailyTokens = 0
+	summary.ApproxTasks = 0
+	summary.ApproxTaskFailures = 0
+	summary.ApproxTaskSuccessRate = 0
+	summary.ZeroTokenModels = nil
+}
+
 func buildTimeline(points []store.TimelinePoint, percentiles []store.LatencyPercentiles, granularity string, location *time.Location, prices map[string]store.ModelPrice) []TimelinePoint {
 	type bucketAccumulator struct {
-		point         TimelinePoint
-		latencyTotal  float64
-		latencySample int64
+		point               TimelinePoint
+		cacheHitTokens      int64
+		cacheHitInputTokens int64
+		latencyTotal        float64
+		latencySample       int64
 	}
-	buckets := make(map[int64]*bucketAccumulator, len(points))
+	orderedPoints := append([]store.TimelinePoint(nil), points...)
+	sort.SliceStable(orderedPoints, func(i, j int) bool {
+		if orderedPoints[i].BucketMS != orderedPoints[j].BucketMS {
+			return orderedPoints[i].BucketMS < orderedPoints[j].BucketMS
+		}
+		if orderedPoints[i].Model != orderedPoints[j].Model {
+			return orderedPoints[i].Model < orderedPoints[j].Model
+		}
+		if orderedPoints[i].BillingModel != orderedPoints[j].BillingModel {
+			return orderedPoints[i].BillingModel < orderedPoints[j].BillingModel
+		}
+		return orderedPoints[i].ServiceTier < orderedPoints[j].ServiceTier
+	})
+
+	buckets := make(map[int64]*bucketAccumulator, len(orderedPoints))
 	order := make([]int64, 0, len(points))
-	for _, point := range points {
+	for _, point := range orderedPoints {
 		bucket := buckets[point.BucketMS]
 		if bucket == nil {
 			bucket = &bucketAccumulator{
@@ -1210,6 +2216,19 @@ func buildTimeline(points []store.TimelinePoint, percentiles []store.LatencyPerc
 		bucket.point.CacheCreationTokens += point.CacheCreationTokens
 		bucket.point.ReasoningTokens += point.ReasoningTokens
 		bucket.point.Cost += costForTimelinePoint(point, prices)
+		behaviorModel := point.BillingModel
+		if strings.TrimSpace(behaviorModel) == "" {
+			behaviorModel = point.Model
+		}
+		cacheHitTokens, cacheHitInputTokens := usage.CacheHitTotals(
+			behaviorModel,
+			point.InputTokens,
+			point.CachedTokens,
+			point.CacheReadTokens,
+			point.CacheCreationTokens,
+		)
+		bucket.cacheHitTokens += cacheHitTokens
+		bucket.cacheHitInputTokens += cacheHitInputTokens
 		if point.AvgLatencyMS.Valid && point.LatencySamples > 0 {
 			bucket.latencyTotal += point.AvgLatencyMS.Float64 * float64(point.LatencySamples)
 			bucket.latencySample += point.LatencySamples
@@ -1224,6 +2243,7 @@ func buildTimeline(points []store.TimelinePoint, percentiles []store.LatencyPerc
 		}
 		bucket.point.SuccessRate = ratio(bucket.point.Success, bucket.point.Calls)
 		bucket.point.FailureRate = ratio(bucket.point.Failure, bucket.point.Calls)
+		bucket.point.CacheHitRate = usage.CacheHitRateFromTotals(bucket.cacheHitTokens, bucket.cacheHitInputTokens)
 		result = append(result, bucket.point)
 	}
 	percentilesByBucket := make(map[int64]store.LatencyPercentiles, len(percentiles))
@@ -1458,6 +2478,9 @@ func buildModelStats(stats []store.ModelStat, prices map[string]store.ModelPrice
 			CachedTokens:        stat.CachedTokens,
 			CacheReadTokens:     stat.CacheReadTokens,
 			CacheCreationTokens: stat.CacheCreationTokens,
+			CacheHitTokens:      stat.CacheHitTokens,
+			CacheHitInputTokens: stat.CacheHitInputTokens,
+			CacheHitRate:        usage.CacheHitRateFromTotals(stat.CacheHitTokens, stat.CacheHitInputTokens),
 			TotalTokens:         stat.TotalTokens,
 			Cost:                stat.Cost,
 		})
@@ -1474,6 +2497,8 @@ type aggregatedModelStat struct {
 	CachedTokens        int64
 	CacheReadTokens     int64
 	CacheCreationTokens int64
+	CacheHitTokens      int64
+	CacheHitInputTokens int64
 	TotalTokens         int64
 	Cost                float64
 }
@@ -1495,6 +2520,19 @@ func aggregateModelStats(stats []store.ModelStat, prices map[string]store.ModelP
 		entry.CachedTokens += stat.CachedTokens
 		entry.CacheReadTokens += stat.CacheReadTokens
 		entry.CacheCreationTokens += stat.CacheCreationTokens
+		behaviorModel := stat.BillingModel
+		if strings.TrimSpace(behaviorModel) == "" {
+			behaviorModel = stat.Model
+		}
+		cacheHitTokens, cacheHitInputTokens := usage.CacheHitTotals(
+			behaviorModel,
+			stat.InputTokens,
+			stat.CachedTokens,
+			stat.CacheReadTokens,
+			stat.CacheCreationTokens,
+		)
+		entry.CacheHitTokens += cacheHitTokens
+		entry.CacheHitInputTokens += cacheHitInputTokens
 		entry.TotalTokens += stat.TotalTokens
 		entry.Cost += costForStat(stat, prices)
 	}
@@ -1660,7 +2698,7 @@ func buildAccountStats(stats []store.AccountModelStat, prices map[string]store.M
 			entry.latencySum += stat.AvgLatencyMS.Float64 * float64(stat.LatencySamples)
 			entry.latencySamples += stat.LatencySamples
 		}
-		addAccountModelStat(entry.models, stat.Model, stat.Calls, stat.SuccessCalls, stat.FailureCalls, stat.InputTokens, stat.OutputTokens, stat.CachedTokens, stat.CacheReadTokens, stat.CacheCreationTokens, stat.TotalTokens, cost, stat.LastSeenMS)
+		addAccountModelStat(entry.models, stat.Model, stat.BillingModel, stat.Calls, stat.SuccessCalls, stat.FailureCalls, stat.InputTokens, stat.OutputTokens, stat.CachedTokens, stat.CacheReadTokens, stat.CacheCreationTokens, stat.TotalTokens, cost, stat.LastSeenMS)
 	}
 
 	result := make([]AccountStatRow, 0, len(grouped))
@@ -1737,7 +2775,7 @@ func buildCredentialStats(stats []store.CredentialModelStat, prices map[string]s
 			entry.latencySum += stat.AvgLatencyMS.Float64 * float64(stat.LatencySamples)
 			entry.latencySamples += stat.LatencySamples
 		}
-		addAccountModelStat(entry.models, stat.Model, stat.Calls, stat.SuccessCalls, stat.FailureCalls, stat.InputTokens, stat.OutputTokens, stat.CachedTokens, stat.CacheReadTokens, stat.CacheCreationTokens, stat.TotalTokens, cost, stat.LastSeenMS)
+		addAccountModelStat(entry.models, stat.Model, stat.BillingModel, stat.Calls, stat.SuccessCalls, stat.FailureCalls, stat.InputTokens, stat.OutputTokens, stat.CachedTokens, stat.CacheReadTokens, stat.CacheCreationTokens, stat.TotalTokens, cost, stat.LastSeenMS)
 	}
 
 	result := make([]CredentialStatRow, 0, len(grouped))
@@ -1828,6 +2866,69 @@ func buildCredentialTimeline(points []store.CredentialTimelinePoint, granularity
 	return result
 }
 
+type apiKeyTimelineAccumulator struct {
+	point          APIKeyTimelinePoint
+	latencySum     float64
+	latencySamples int64
+}
+
+func buildAPIKeyTimeline(points []store.APIKeyTimelinePoint, granularity string, location *time.Location, prices map[string]store.ModelPrice) []APIKeyTimelinePoint {
+	type key struct {
+		apiKeyHash string
+		bucketMS   int64
+	}
+	grouped := map[key]*apiKeyTimelineAccumulator{}
+	order := make([]key, 0, len(points))
+	for _, point := range points {
+		apiKeyHash := strings.TrimSpace(point.APIKeyHash)
+		if apiKeyHash == "" {
+			continue
+		}
+		mapKey := key{apiKeyHash: apiKeyHash, bucketMS: point.BucketMS}
+		entry := grouped[mapKey]
+		if entry == nil {
+			entry = &apiKeyTimelineAccumulator{
+				point: APIKeyTimelinePoint{
+					APIKeyHash:  apiKeyHash,
+					BucketMS:    point.BucketMS,
+					BucketLabel: timelineLabel(point.BucketMS, granularity, location),
+				},
+			}
+			grouped[mapKey] = entry
+			order = append(order, mapKey)
+		}
+		entry.point.Calls += point.Calls
+		entry.point.Tokens += point.Tokens
+		entry.point.TotalTokens += point.Tokens
+		entry.point.Success += point.Success
+		entry.point.Failure += point.Failure
+		entry.point.InputTokens += point.InputTokens
+		entry.point.OutputTokens += point.OutputTokens
+		entry.point.CachedTokens += point.CachedTokens
+		entry.point.CacheReadTokens += point.CacheReadTokens
+		entry.point.CacheCreationTokens += point.CacheCreationTokens
+		entry.point.ReasoningTokens += point.ReasoningTokens
+		entry.point.Cost += costForAPIKeyTimelinePoint(point, prices)
+		if point.AvgLatencyMS.Valid && point.LatencySamples > 0 {
+			entry.latencySum += point.AvgLatencyMS.Float64 * float64(point.LatencySamples)
+			entry.latencySamples += point.LatencySamples
+		}
+	}
+
+	result := make([]APIKeyTimelinePoint, 0, len(order))
+	for _, mapKey := range order {
+		entry := grouped[mapKey]
+		if entry.latencySamples > 0 {
+			value := entry.latencySum / float64(entry.latencySamples)
+			entry.point.AvgLatencyMS = &value
+		}
+		entry.point.SuccessRate = ratio(entry.point.Success, entry.point.Calls)
+		entry.point.FailureRate = ratio(entry.point.Failure, entry.point.Calls)
+		result = append(result, entry.point)
+	}
+	return result
+}
+
 func buildAPIKeyStats(stats []store.APIKeyModelStat, prices map[string]store.ModelPrice) []APIKeyStatRow {
 	grouped := map[string]*apiKeyStatAccumulator{}
 	for _, stat := range stats {
@@ -1885,7 +2986,7 @@ func buildAPIKeyStats(stats []store.APIKeyModelStat, prices map[string]store.Mod
 			entry.latencySamples += stat.LatencySamples
 		}
 		addAPIKeyContextStat(entry.contexts, stat, cost)
-		addAccountModelStat(entry.models, stat.Model, stat.Calls, stat.SuccessCalls, stat.FailureCalls, stat.InputTokens, stat.OutputTokens, stat.CachedTokens, stat.CacheReadTokens, stat.CacheCreationTokens, stat.TotalTokens, cost, stat.LastSeenMS)
+		addAccountModelStat(entry.models, stat.Model, stat.BillingModel, stat.Calls, stat.SuccessCalls, stat.FailureCalls, stat.InputTokens, stat.OutputTokens, stat.CachedTokens, stat.CacheReadTokens, stat.CacheCreationTokens, stat.TotalTokens, cost, stat.LastSeenMS)
 	}
 
 	result := make([]APIKeyStatRow, 0, len(grouped))
@@ -2131,6 +3232,7 @@ func addAccountTotals(
 func addAccountModelStat(
 	models map[string]*AccountModelStatRow,
 	model string,
+	billingModel string,
 	calls int64,
 	successCalls int64,
 	failureCalls int64,
@@ -2160,6 +3262,20 @@ func addAccountModelStat(
 	entry.CachedTokens += cachedTokens
 	entry.CacheReadTokens += cacheReadTokens
 	entry.CacheCreationTokens += cacheCreationTokens
+	behaviorModel := billingModel
+	if strings.TrimSpace(behaviorModel) == "" {
+		behaviorModel = modelKey
+	}
+	cacheHitTokens, cacheHitInputTokens := usage.CacheHitTotals(
+		behaviorModel,
+		inputTokens,
+		cachedTokens,
+		cacheReadTokens,
+		cacheCreationTokens,
+	)
+	entry.CacheHitTokens += cacheHitTokens
+	entry.CacheHitInputTokens += cacheHitInputTokens
+	entry.CacheHitRate = usage.CacheHitRateFromTotals(entry.CacheHitTokens, entry.CacheHitInputTokens)
 	entry.TotalTokens += totalTokens
 	entry.Cost += cost
 	if lastSeenMS > entry.LastSeenMS {
@@ -2318,10 +3434,15 @@ func buildEvents(page store.EventsPage, totalCount int64) *EventsResponse {
 			EventHash:              item.EventHash,
 			TimestampMS:            item.TimestampMS,
 			Model:                  item.Model,
+			AnalyticsModel:         item.AnalyticsModel,
+			RequestedModel:         item.RequestedModel,
 			ResolvedModel:          item.ResolvedModel,
 			Endpoint:               item.Endpoint,
 			Method:                 item.Method,
 			Path:                   item.Path,
+			ClientIP:               item.ClientIP,
+			XForwardedFor:          item.XForwardedFor,
+			UserAgent:              item.UserAgent,
 			AuthIndex:              item.AuthIndex,
 			Source:                 item.Source,
 			SourceHash:             item.SourceHash,
@@ -2364,6 +3485,10 @@ func buildHeaderSnapshots(items []store.HeaderSnapshot) []HeaderSnapshot {
 		result = append(result, HeaderSnapshot{
 			EventHash:              item.EventHash,
 			TimestampMS:            item.TimestampMS,
+			Model:                  item.Model,
+			AnalyticsModel:         item.AnalyticsModel,
+			RequestedModel:         item.RequestedModel,
+			ResolvedModel:          item.ResolvedModel,
 			AuthFileSnapshot:       item.AuthFileSnapshot,
 			AuthIndex:              item.AuthIndex,
 			AccountSnapshot:        item.AccountSnapshot,
@@ -2395,21 +3520,53 @@ type accountHistoryTotal struct {
 }
 
 func accountHistoryTargetKey(target AccountHistoryTarget) (string, bool) {
-	if key := strings.TrimSpace(target.AccountKey); key != "" {
-		return key, true
-	}
-	if strings.TrimSpace(target.AccountSnapshot) == "" &&
-		strings.TrimSpace(target.AuthLabelSnapshot) == "" &&
-		strings.TrimSpace(target.Source) == "" &&
-		strings.TrimSpace(target.AuthIndex) == "" {
+	if !AccountHistoryTargetHasRequiredProvider(target) {
 		return "", false
 	}
-	return store.AccountHistoryKey(
-		target.AccountSnapshot,
-		target.AuthLabelSnapshot,
-		target.Source,
-		target.AuthIndex,
-	), true
+	if key, valid := usageidentity.AccountKey(usageidentity.Fields{
+		AuthFileSnapshot:      target.AuthFileSnapshot,
+		AuthIndex:             target.AuthIndex,
+		AuthProviderSnapshot:  target.AuthProviderSnapshot,
+		AuthProjectIDSnapshot: target.AuthProjectIDSnapshot,
+		AccountSnapshot:       target.AccountSnapshot,
+		AuthLabelSnapshot:     target.AuthLabelSnapshot,
+		Source:                target.Source,
+	}); valid {
+		return key, true
+	}
+	key := strings.TrimSpace(target.AccountKey)
+	return key, key != ""
+}
+
+func latestAccountRequestTargetValid(target AccountHistoryTarget) bool {
+	return accountHistoryAuthFileSnapshot(target) != ""
+}
+
+func accountHistoryAuthFileSnapshot(target AccountHistoryTarget) string {
+	if value := strings.TrimSpace(target.AuthFileSnapshot); value != "" {
+		return value
+	}
+	return strings.TrimSpace(target.Source)
+}
+
+func accountLatestRequestFromStore(request store.LatestAccountRequest) *AccountLatestRequest {
+	if request.TimestampMS <= 0 {
+		return nil
+	}
+	var failStatusCode *int
+	if request.FailStatusCode.Valid && request.FailStatusCode.Int64 > 0 {
+		value := int(request.FailStatusCode.Int64)
+		failStatusCode = &value
+	}
+	return &AccountLatestRequest{
+		TimestampMS:     request.TimestampMS,
+		Failed:          request.Failed,
+		FailStatusCode:  failStatusCode,
+		FailSummary:     request.FailSummary,
+		HeaderErrorKind: request.HeaderErrorKind,
+		HeaderErrorCode: request.HeaderErrorCode,
+		HeaderTraceID:   request.HeaderTraceID,
+	}
 }
 
 func buildAccountHistoryTotals(rows []store.AccountHistoryRollupRow, prices map[string]store.ModelPrice) map[string]*accountHistoryTotal {
@@ -2451,6 +3608,314 @@ func buildAccountHistoryTotals(rows []store.AccountHistoryRollupRow, prices map[
 	return totals
 }
 
+func buildPricingAccountHistoryTotals(rows []store.UsagePricingAccountRow, prices map[string]store.ModelPrice) map[string]*accountHistoryTotal {
+	totals := map[string]*accountHistoryTotal{}
+	for _, row := range rows {
+		total := totals[row.AccountKey]
+		if total == nil {
+			total = &accountHistoryTotal{}
+			totals[row.AccountKey] = total
+		}
+		total.requests += row.Calls
+		total.successCalls += row.SuccessCalls
+		total.failureCalls += row.FailureCalls
+		total.totalTokens += row.TotalTokens
+		total.cost += pricing.CostForModelCandidatesWithServiceTier(
+			[]string{row.BillingModel, row.Model},
+			row.ServiceTier,
+			pricing.ModelTokens{
+				PricingModel:            row.PricingModel,
+				ContextThresholdTokens:  row.ContextThresholdTokens,
+				InputTokens:             row.InputTokens,
+				OutputTokens:            row.OutputTokens,
+				CachedTokens:            row.CachedTokens,
+				CacheReadTokens:         row.CacheReadTokens,
+				CacheCreationTokens:     row.CacheCreationTokens,
+				LongInputTokens:         row.LongInputTokens,
+				LongOutputTokens:        row.LongOutputTokens,
+				LongCachedTokens:        row.LongCachedTokens,
+				LongCacheReadTokens:     row.LongCacheReadTokens,
+				LongCacheCreationTokens: row.LongCacheCreationTokens,
+			},
+			prices,
+		)
+		if total.firstSeenMS == 0 || (row.FirstSeenMS > 0 && row.FirstSeenMS < total.firstSeenMS) {
+			total.firstSeenMS = row.FirstSeenMS
+		}
+		if row.LastSeenMS > total.lastSeenMS {
+			total.lastSeenMS = row.LastSeenMS
+		}
+	}
+	return totals
+}
+
+func accountWindowUsageTargetKey(target AccountWindowUsageTarget) (string, bool) {
+	if !AccountWindowUsageTargetHasCredentialIdentity(target) {
+		return "", false
+	}
+	return usageidentity.AccountKey(usageidentity.Fields{
+		AuthFileSnapshot:      target.AuthFileSnapshot,
+		AuthIndex:             target.AuthIndex,
+		AuthProviderSnapshot:  target.AuthProviderSnapshot,
+		AuthProjectIDSnapshot: target.AuthProjectIDSnapshot,
+		AccountSnapshot:       target.AccountSnapshot,
+		AuthLabelSnapshot:     target.AuthLabelSnapshot,
+		Source:                target.Source,
+	})
+}
+
+func AccountHistoryTargetHasRequiredProvider(target AccountHistoryTarget) bool {
+	return accountTargetHasRequiredProvider(
+		target.AuthFileSnapshot,
+		target.AuthProviderSnapshot,
+		target.AccountSnapshot,
+		target.AuthLabelSnapshot,
+		target.Source,
+	)
+}
+
+func AccountWindowUsageTargetHasRequiredProvider(target AccountWindowUsageTarget) bool {
+	return accountTargetHasRequiredProvider(
+		target.AuthFileSnapshot,
+		target.AuthProviderSnapshot,
+		target.AccountSnapshot,
+		target.AuthLabelSnapshot,
+		target.Source,
+	)
+}
+
+func AccountWindowUsageTargetHasCredentialIdentity(target AccountWindowUsageTarget) bool {
+	authFile := strings.TrimSpace(target.AuthFileSnapshot)
+	account := strings.TrimSpace(target.AccountSnapshot)
+	label := strings.TrimSpace(target.AuthLabelSnapshot)
+	source := strings.TrimSpace(target.Source)
+	provider := strings.TrimSpace(target.AuthProviderSnapshot)
+	if effectiveAccountTargetFile(authFile, account, label, source) != "" {
+		return AccountWindowUsageTargetHasRequiredProvider(target)
+	}
+	if provider == "" {
+		return false
+	}
+	return strings.TrimSpace(target.AuthIndex) != "" ||
+		strings.TrimSpace(target.AuthProjectIDSnapshot) != "" ||
+		account != "" || label != ""
+}
+
+func accountTargetHasRequiredProvider(authFile, provider, account, label, source string) bool {
+	return effectiveAccountTargetFile(authFile, account, label, source) == "" ||
+		strings.TrimSpace(provider) != ""
+}
+
+func effectiveAccountTargetFile(authFile, account, label, source string) string {
+	if value := strings.TrimSpace(authFile); value != "" {
+		return value
+	}
+	account = strings.TrimSpace(account)
+	label = strings.TrimSpace(label)
+	source = strings.TrimSpace(source)
+	if source != "" && source != account && source != label {
+		return source
+	}
+	return ""
+}
+
+type accountWindowScopeResult struct {
+	status            string
+	unmatchedRequests int64
+}
+
+func normalizeAccountWindowPeriod(value string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(value))
+	if trimmed == "" {
+		return "current"
+	}
+	switch trimmed {
+	case "current", "previous", "previous_equal_range":
+		return trimmed
+	default:
+		return ""
+	}
+}
+
+func normalizeAccountWindowModelScope(
+	scope AccountWindowModelScope,
+	provided bool,
+	completeSet bool,
+) AccountWindowModelScope {
+	scope.Kind = strings.ToLower(strings.TrimSpace(scope.Kind))
+	if scope.Kind == "" {
+		if provided {
+			return AccountWindowModelScope{}
+		}
+		scope.Kind = "all"
+		scope.Complete = true
+	}
+	switch scope.Kind {
+	case "all", "family", "models", "product", "feature":
+	default:
+		return AccountWindowModelScope{}
+	}
+	scope.Key = strings.ToLower(strings.TrimSpace(scope.Key))
+	seen := make(map[string]struct{}, len(scope.Models))
+	models := make([]string, 0, len(scope.Models))
+	for _, modelName := range scope.Models {
+		normalized := normalizeQuotaModelName(modelName)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		models = append(models, normalized)
+	}
+	scope.Models = models
+	if scope.Kind == "models" && len(scope.Models) == 0 {
+		return AccountWindowModelScope{}
+	}
+	if (scope.Kind == "family" || scope.Kind == "product" || scope.Kind == "feature") && scope.Key == "" && len(scope.Models) == 0 {
+		return AccountWindowModelScope{}
+	}
+	if !completeSet {
+		switch scope.Kind {
+		case "all", "family", "models":
+			scope.Complete = true
+		}
+	}
+	return scope
+}
+
+func normalizeQuotaModelName(value string) string {
+	return strings.ToLower(usageidentity.AnalyticsModel(strings.TrimSpace(value)))
+}
+
+func classifyQuotaModelFamily(modelName string) string {
+	normalized := normalizeQuotaModelName(modelName)
+	switch {
+	case normalized == "":
+		return "unknown"
+	case strings.Contains(normalized, "claude"),
+		strings.Contains(normalized, "gpt"),
+		strings.Contains(normalized, "o1"),
+		strings.Contains(normalized, "o3"),
+		strings.Contains(normalized, "o4"):
+		return "claude_gpt"
+	case strings.Contains(normalized, "gemini"):
+		return "gemini"
+	default:
+		return "unknown"
+	}
+}
+
+func accountWindowStatMatchesScope(row store.AccountWindowModelStat, scope AccountWindowModelScope) (matched bool, unmatched bool) {
+	if !scope.Complete {
+		return false, false
+	}
+	if scope.Kind == "all" {
+		return true, false
+	}
+	if codexquota.IsMainScope(scope.Kind, scope.Key) {
+		return codexquota.MatchMainUsage(row.Model, row.BillingModel)
+	}
+	if len(scope.Models) > 0 {
+		return codexquota.MatchModelScope(row.Model, row.BillingModel, scope.Models)
+	}
+	rowModels := []string{normalizeQuotaModelName(row.Model), normalizeQuotaModelName(row.BillingModel)}
+	if scope.Kind != "family" {
+		return false, false
+	}
+	if len(rowModels) == 2 && rowModels[1] != "" {
+		rowModels = rowModels[1:]
+	}
+	if scope.Kind == "family" {
+		families := map[string]struct{}{}
+		for _, modelName := range rowModels {
+			families[classifyQuotaModelFamily(modelName)] = struct{}{}
+		}
+		if _, ok := families[scope.Key]; ok {
+			return true, false
+		}
+		_, unknown := families["unknown"]
+		return false, unknown
+	}
+	return false, true
+}
+
+func buildScopedAccountWindowUsageTotals(
+	rows []store.AccountWindowModelStat,
+	windows []AccountWindowUsageTarget,
+	prices map[string]store.ModelPrice,
+) (map[int]*accountHistoryTotal, map[int]accountWindowScopeResult) {
+	filtered := make([]store.AccountWindowModelStat, 0, len(rows))
+	results := make(map[int]accountWindowScopeResult, len(windows))
+	for index, window := range windows {
+		status := "complete"
+		if !window.ModelScope.Complete {
+			status = "unmatched"
+		}
+		results[index] = accountWindowScopeResult{status: status}
+	}
+	for _, row := range rows {
+		if row.RequestIndex < 0 || row.RequestIndex >= len(windows) {
+			continue
+		}
+		matched, unmatched := accountWindowStatMatchesScope(row, windows[row.RequestIndex].ModelScope)
+		result := results[row.RequestIndex]
+		if unmatched {
+			result.unmatchedRequests += row.Calls
+		}
+		if matched {
+			filtered = append(filtered, row)
+		}
+		results[row.RequestIndex] = result
+	}
+	for index, result := range results {
+		if result.unmatchedRequests > 0 && result.status == "complete" {
+			result.status = "partial"
+		}
+		results[index] = result
+	}
+	return buildAccountWindowUsageTotals(filtered, prices), results
+}
+
+func buildAccountWindowUsageTotals(rows []store.AccountWindowModelStat, prices map[string]store.ModelPrice) map[int]*accountHistoryTotal {
+	totals := map[int]*accountHistoryTotal{}
+	for _, row := range rows {
+		total := totals[row.RequestIndex]
+		if total == nil {
+			total = &accountHistoryTotal{}
+			totals[row.RequestIndex] = total
+		}
+		total.requests += row.Calls
+		total.successCalls += row.SuccessCalls
+		total.failureCalls += row.FailureCalls
+		total.totalTokens += row.TotalTokens
+		total.cost += pricing.CostForModelCandidatesWithServiceTier(
+			[]string{row.BillingModel, row.Model},
+			row.ServiceTier,
+			pricing.ModelTokens{
+				PricingModel:            row.PricingModel,
+				ContextThresholdTokens:  row.ContextThresholdTokens,
+				InputTokens:             row.InputTokens,
+				OutputTokens:            row.OutputTokens,
+				CachedTokens:            row.CachedTokens,
+				CacheReadTokens:         row.CacheReadTokens,
+				CacheCreationTokens:     row.CacheCreationTokens,
+				LongInputTokens:         row.LongInputTokens,
+				LongOutputTokens:        row.LongOutputTokens,
+				LongCachedTokens:        row.LongCachedTokens,
+				LongCacheReadTokens:     row.LongCacheReadTokens,
+				LongCacheCreationTokens: row.LongCacheCreationTokens,
+			},
+			prices,
+		)
+		if row.LastSeenMS > total.lastSeenMS {
+			total.lastSeenMS = row.LastSeenMS
+		}
+	}
+	return totals
+}
+
 func accountHistorySyncStatus(matched bool, pending bool) string {
 	if pending {
 		return "pending"
@@ -2478,6 +3943,8 @@ func sumCost(stats []store.ModelStat, prices map[string]store.ModelPrice) float6
 
 func costForStat(stat store.ModelStat, prices map[string]store.ModelPrice) float64 {
 	return pricing.CostForModelCandidatesWithServiceTier([]string{stat.BillingModel, stat.Model}, stat.ServiceTier, pricing.ModelTokens{
+		PricingModel:            stat.PricingModel,
+		ContextThresholdTokens:  stat.ContextThresholdTokens,
 		InputTokens:             stat.InputTokens,
 		OutputTokens:            stat.OutputTokens,
 		CachedTokens:            stat.CachedTokens,
@@ -2493,6 +3960,8 @@ func costForStat(stat store.ModelStat, prices map[string]store.ModelPrice) float
 
 func costForTimelinePoint(point store.TimelinePoint, prices map[string]store.ModelPrice) float64 {
 	return pricing.CostForModelCandidatesWithServiceTier([]string{point.BillingModel, point.Model}, point.ServiceTier, pricing.ModelTokens{
+		PricingModel:            point.PricingModel,
+		ContextThresholdTokens:  point.ContextThresholdTokens,
 		InputTokens:             point.InputTokens,
 		OutputTokens:            point.OutputTokens,
 		CachedTokens:            point.CachedTokens,
@@ -2508,6 +3977,8 @@ func costForTimelinePoint(point store.TimelinePoint, prices map[string]store.Mod
 
 func costForHeatmapPoint(point store.HeatmapPoint, prices map[string]store.ModelPrice) float64 {
 	return pricing.CostForModelCandidatesWithServiceTier([]string{point.BillingModel, point.Model}, point.ServiceTier, pricing.ModelTokens{
+		PricingModel:            point.PricingModel,
+		ContextThresholdTokens:  point.ContextThresholdTokens,
 		InputTokens:             point.InputTokens,
 		OutputTokens:            point.OutputTokens,
 		CachedTokens:            point.CachedTokens,
@@ -2523,6 +3994,8 @@ func costForHeatmapPoint(point store.HeatmapPoint, prices map[string]store.Model
 
 func costForChannelStat(stat store.ChannelModelStat, prices map[string]store.ModelPrice) float64 {
 	return pricing.CostForModelCandidatesWithServiceTier([]string{stat.BillingModel, stat.Model}, stat.ServiceTier, pricing.ModelTokens{
+		PricingModel:            stat.PricingModel,
+		ContextThresholdTokens:  stat.ContextThresholdTokens,
 		InputTokens:             stat.InputTokens,
 		OutputTokens:            stat.OutputTokens,
 		CachedTokens:            stat.CachedTokens,
@@ -2538,6 +4011,8 @@ func costForChannelStat(stat store.ChannelModelStat, prices map[string]store.Mod
 
 func costForAccountModelStat(stat store.AccountModelStat, prices map[string]store.ModelPrice) float64 {
 	return pricing.CostForModelCandidatesWithServiceTier([]string{stat.BillingModel, stat.Model}, stat.ServiceTier, pricing.ModelTokens{
+		PricingModel:            stat.PricingModel,
+		ContextThresholdTokens:  stat.ContextThresholdTokens,
 		InputTokens:             stat.InputTokens,
 		OutputTokens:            stat.OutputTokens,
 		CachedTokens:            stat.CachedTokens,
@@ -2553,6 +4028,8 @@ func costForAccountModelStat(stat store.AccountModelStat, prices map[string]stor
 
 func costForAPIKeyModelStat(stat store.APIKeyModelStat, prices map[string]store.ModelPrice) float64 {
 	return pricing.CostForModelCandidatesWithServiceTier([]string{stat.BillingModel, stat.Model}, stat.ServiceTier, pricing.ModelTokens{
+		PricingModel:            stat.PricingModel,
+		ContextThresholdTokens:  stat.ContextThresholdTokens,
 		InputTokens:             stat.InputTokens,
 		OutputTokens:            stat.OutputTokens,
 		CachedTokens:            stat.CachedTokens,
@@ -2568,6 +4045,8 @@ func costForAPIKeyModelStat(stat store.APIKeyModelStat, prices map[string]store.
 
 func costForCredentialModelStat(stat store.CredentialModelStat, prices map[string]store.ModelPrice) float64 {
 	return pricing.CostForModelCandidatesWithServiceTier([]string{stat.BillingModel, stat.Model}, stat.ServiceTier, pricing.ModelTokens{
+		PricingModel:            stat.PricingModel,
+		ContextThresholdTokens:  stat.ContextThresholdTokens,
 		InputTokens:             stat.InputTokens,
 		OutputTokens:            stat.OutputTokens,
 		CachedTokens:            stat.CachedTokens,
@@ -2583,6 +4062,25 @@ func costForCredentialModelStat(stat store.CredentialModelStat, prices map[strin
 
 func costForCredentialTimelinePoint(point store.CredentialTimelinePoint, prices map[string]store.ModelPrice) float64 {
 	return pricing.CostForModelCandidatesWithServiceTier([]string{point.BillingModel, point.Model}, point.ServiceTier, pricing.ModelTokens{
+		PricingModel:            point.PricingModel,
+		ContextThresholdTokens:  point.ContextThresholdTokens,
+		InputTokens:             point.InputTokens,
+		OutputTokens:            point.OutputTokens,
+		CachedTokens:            point.CachedTokens,
+		CacheReadTokens:         point.CacheReadTokens,
+		CacheCreationTokens:     point.CacheCreationTokens,
+		LongInputTokens:         point.LongInputTokens,
+		LongOutputTokens:        point.LongOutputTokens,
+		LongCachedTokens:        point.LongCachedTokens,
+		LongCacheReadTokens:     point.LongCacheReadTokens,
+		LongCacheCreationTokens: point.LongCacheCreationTokens,
+	}, prices)
+}
+
+func costForAPIKeyTimelinePoint(point store.APIKeyTimelinePoint, prices map[string]store.ModelPrice) float64 {
+	return pricing.CostForModelCandidatesWithServiceTier([]string{point.BillingModel, point.Model}, point.ServiceTier, pricing.ModelTokens{
+		PricingModel:            point.PricingModel,
+		ContextThresholdTokens:  point.ContextThresholdTokens,
 		InputTokens:             point.InputTokens,
 		OutputTokens:            point.OutputTokens,
 		CachedTokens:            point.CachedTokens,
@@ -2628,23 +4126,35 @@ func averageTokensPerRequest(point TimelinePoint) float64 {
 }
 
 func cacheHitRate(point TimelinePoint) float64 {
-	// Mirror computeCacheHitRate on the web client: cache-read tokens over total
-	// input. cacheRead falls back to cachedTokens for OpenAI-style usage (input
-	// already includes cache); totalInput adds cacheRead/cacheCreation back for
-	// Anthropic-style usage where InputTokens excludes them.
-	cacheRead := point.CacheReadTokens
-	if cacheRead == 0 {
-		cacheRead = point.CachedTokens
+	rate := point.CacheHitRate
+	if rate <= 0 {
+		rate = usage.CacheHitRate("", point.InputTokens, point.CachedTokens, point.CacheReadTokens, point.CacheCreationTokens)
 	}
-	totalInput := point.InputTokens + point.CacheReadTokens + point.CacheCreationTokens
-	if totalInput <= 0 {
-		return 0
-	}
-	rate := float64(cacheRead) / float64(totalInput)
 	if rate > 1 {
 		return 1
 	}
 	return rate
+}
+
+func cacheHitRateForModelStats(stats []store.ModelStat) float64 {
+	var hitTokens int64
+	var inputTokens int64
+	for _, stat := range stats {
+		behaviorModel := stat.BillingModel
+		if strings.TrimSpace(behaviorModel) == "" {
+			behaviorModel = stat.Model
+		}
+		statHitTokens, statInputTokens := usage.CacheHitTotals(
+			behaviorModel,
+			stat.InputTokens,
+			stat.CachedTokens,
+			stat.CacheReadTokens,
+			stat.CacheCreationTokens,
+		)
+		hitTokens += statHitTokens
+		inputTokens += statInputTokens
+	}
+	return usage.CacheHitRateFromTotals(hitTokens, inputTokens)
 }
 
 func floatValueOrZero(value *float64) float64 {

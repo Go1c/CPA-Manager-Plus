@@ -1,13 +1,15 @@
-import type {
-  ApiKeyEntry,
-  CloakConfig,
-  GeminiKeyConfig,
-  ModelAlias,
-  OpenAIProviderConfig,
-  ProviderKeyConfig,
+import {
+  readCoolingOverride,
+  type ApiKeyEntry,
+  type CloakConfig,
+  type GeminiKeyConfig,
+  type ModelAlias,
+  type OpenAIProviderConfig,
+  type ProviderKeyConfig,
 } from '@/types';
 import type { Config } from '@/types/config';
 import { buildHeaderObject } from '@/utils/headers';
+import { normalizeCredentialWeight } from '@/utils/credentialWeight';
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -28,6 +30,11 @@ const normalizeString = (value: unknown): string | undefined => {
   if (value === undefined || value === null) return undefined;
   const trimmed = String(value).trim();
   return trimmed ? trimmed : undefined;
+};
+
+const normalizeStringList = (value: unknown): string[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  return value.map(normalizeString).filter((item): item is string => Boolean(item));
 };
 
 const normalizeNumber = (value: unknown): number | undefined => {
@@ -168,6 +175,8 @@ const normalizeApiKeyEntry = (entry: unknown): ApiKeyEntry | null => {
     proxyUrl: proxyUrl ? String(proxyUrl) : undefined,
     headers,
   };
+  const weight = normalizeCredentialWeight(record?.weight);
+  if (weight !== undefined) result.weight = weight;
   if (authIndex) result.authIndex = authIndex;
   return result;
 };
@@ -190,6 +199,8 @@ const normalizeProviderKeyConfig = (item: unknown): ProviderKeyConfig | null => 
       config.priority = parsed;
     }
   }
+  const weight = normalizeCredentialWeight(record?.weight);
+  if (weight !== undefined) config.weight = weight;
   const prefix = normalizePrefix(record?.prefix ?? record?.['prefix']);
   if (prefix) config.prefix = prefix;
   const baseUrl = record ? (record['base-url'] ?? record.baseUrl) : undefined;
@@ -197,9 +208,7 @@ const normalizeProviderKeyConfig = (item: unknown): ProviderKeyConfig | null => 
   if (baseUrl) config.baseUrl = String(baseUrl);
   const websockets = normalizeBoolean(record?.websockets ?? record?.['websockets']);
   if (websockets !== undefined) config.websockets = websockets;
-  const disableCooling = normalizeBoolean(
-    record?.['disable-cooling'] ?? record?.disableCooling ?? record?.disable_cooling
-  );
+  const disableCooling = readCoolingOverride(record);
   if (disableCooling !== undefined) config.disableCooling = disableCooling;
   const experimentalCchSigning = normalizeBoolean(
     record?.['experimental-cch-signing'] ??
@@ -283,6 +292,8 @@ const normalizeGeminiKeyConfig = (item: unknown): GeminiKeyConfig | null => {
       config.priority = parsed;
     }
   }
+  const weight = normalizeCredentialWeight(record?.weight);
+  if (weight !== undefined) config.weight = weight;
   const prefix = normalizePrefix(record?.prefix ?? record?.['prefix']);
   if (prefix) config.prefix = prefix;
   const baseUrl = record ? (record['base-url'] ?? record.baseUrl ?? record['base_url']) : undefined;
@@ -291,9 +302,7 @@ const normalizeGeminiKeyConfig = (item: unknown): GeminiKeyConfig | null => {
     ? (record['proxy-url'] ?? record.proxyUrl ?? record['proxy_url'])
     : undefined;
   if (proxyUrl) config.proxyUrl = String(proxyUrl);
-  const disableCooling = normalizeBoolean(
-    record?.['disable-cooling'] ?? record?.disableCooling ?? record?.disable_cooling
-  );
+  const disableCooling = readCoolingOverride(record);
   if (disableCooling !== undefined) config.disableCooling = disableCooling;
   const models = normalizeModelAliases(record?.models);
   if (models.length) config.models = models;
@@ -337,9 +346,7 @@ const normalizeOpenAIProvider = (provider: unknown): OpenAIProviderConfig | null
 
   const disabled = normalizeBoolean(provider.disabled ?? provider['disabled']);
   if (disabled !== undefined) result.disabled = disabled;
-  const disableCooling = normalizeBoolean(
-    provider['disable-cooling'] ?? provider.disableCooling ?? provider.disable_cooling
-  );
+  const disableCooling = readCoolingOverride(provider);
   if (disableCooling !== undefined) result.disableCooling = disableCooling;
   const prefix = normalizePrefix(provider.prefix ?? provider['prefix']);
   if (prefix) result.prefix = prefix;
@@ -418,6 +425,9 @@ export const normalizeConfigResponse = (raw: unknown): Config => {
     config.clean = {
       baseUrl: normalizeString(clean['base_url'] ?? clean.baseUrl ?? clean['base-url']),
       token: normalizeString(clean.token),
+      targetTypes: normalizeStringList(
+        clean['target_types'] ?? clean.targetTypes ?? clean['target-types']
+      ),
       targetType: normalizeString(clean['target_type'] ?? clean.targetType ?? clean['target-type']),
       workers: normalizeNumber(clean.workers),
       deleteWorkers: normalizeNumber(
@@ -426,6 +436,22 @@ export const normalizeConfigResponse = (raw: unknown): Config => {
       timeout: normalizeNumber(clean.timeout),
       retries: normalizeNumber(clean.retries),
       userAgent: normalizeString(clean['user_agent'] ?? clean.userAgent ?? clean['user-agent']),
+      xaiInferenceUserAgent: normalizeString(
+        clean['xai_inference_user_agent'] ??
+          clean.xaiInferenceUserAgent ??
+          clean['xai-inference-user-agent']
+      ),
+      xaiInferenceEnabled: normalizeBoolean(
+        clean['xai_inference_enabled'] ??
+          clean.xaiInferenceEnabled ??
+          clean['xai-inference-enabled']
+      ),
+      xaiInferenceModel: normalizeString(
+        clean['xai_inference_model'] ?? clean.xaiInferenceModel ?? clean['xai-inference-model']
+      ),
+      xaiInferencePrompt: normalizeString(
+        clean['xai_inference_prompt'] ?? clean.xaiInferencePrompt ?? clean['xai-inference-prompt']
+      ),
       usedPercentThreshold: threshold,
       sampleSize: normalizeNumber(clean['sample_size'] ?? clean.sampleSize ?? clean['sample-size']),
     };
@@ -486,6 +512,13 @@ export const normalizeConfigResponse = (raw: unknown): Config => {
   const codexList = raw['codex-api-key'] ?? raw.codexApiKey ?? raw.codexApiKeys;
   if (Array.isArray(codexList)) {
     config.codexApiKeys = codexList
+      .map((item) => normalizeProviderKeyConfig(item))
+      .filter(Boolean) as ProviderKeyConfig[];
+  }
+
+  const xaiList = raw['xai-api-key'] ?? raw.xaiApiKey ?? raw.xaiApiKeys;
+  if (Array.isArray(xaiList)) {
+    config.xaiApiKeys = xaiList
       .map((item) => normalizeProviderKeyConfig(item))
       .filter(Boolean) as ProviderKeyConfig[];
   }

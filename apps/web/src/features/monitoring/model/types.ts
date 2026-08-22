@@ -3,6 +3,7 @@ import type { ResponseHeaderMetadata } from '@/services/api/usageService';
 import type { AuthFileItem } from '@/types/authFile';
 import type { Config } from '@/types/config';
 import type { ModelPrice } from '@/utils/usage';
+import type { MonitoringDataTab } from '../monitoringCenterUiState';
 
 export type MonitoringChannelMeta = {
   key: string;
@@ -147,10 +148,14 @@ export type MonitoringEventRow = {
   dayKey: string;
   hourLabel: string;
   model: string;
+  requestedModel?: string;
   resolvedModel?: string;
   endpoint: string;
   endpointMethod: string;
   endpointPath: string;
+  clientIp?: string;
+  xForwardedFor?: string;
+  userAgent?: string;
   sourceKey: string;
   source: string;
   sourceMasked: string;
@@ -183,6 +188,8 @@ export type MonitoringEventRow = {
   totalCost: number;
   reasoningEffort?: string;
   serviceTier?: string;
+  requestServiceTier?: string;
+  responseServiceTier?: string;
   executorType?: string;
   failStatusCode?: number | null;
   failSummary?: string;
@@ -208,6 +215,7 @@ export type MonitoringSummary = {
   cachedTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  cacheHitRate?: number;
   totalTokens: number;
   totalCost: number;
   averageLatencyMs: number | null;
@@ -272,6 +280,7 @@ export type MonitoringApiKeyRow = {
   apiKeyHash: string;
   apiKeyLabel: string;
   apiKeyMasked: string;
+  apiKeyCopyValue?: string;
   isUnknown: boolean;
   authLabels: string[];
   sourceLabels: string[];
@@ -295,6 +304,8 @@ export type MonitoringApiKeyRow = {
 export type MonitoringFilterOptions = {
   accountRows: MonitoringAccountRow[];
   apiKeyRows: MonitoringApiKeyRow[];
+  accountCount?: number;
+  apiKeyCount?: number;
   providers: string[];
   models: string[];
   channels: string[];
@@ -344,6 +355,7 @@ export interface MonitoringScopeFilters {
   account?: string;
   provider?: string;
   authFile?: string;
+  authIndex?: string;
   projectId?: string;
   requestType?: string;
   model?: string;
@@ -365,6 +377,7 @@ export interface UseMonitoringDataParams {
   searchQuery: string;
   searchApiKeyHash?: string;
   scopeFilters?: MonitoringScopeFilters;
+  activeDataTab?: MonitoringDataTab;
 }
 
 export interface UseMonitoringDataReturn {

@@ -29,6 +29,8 @@ import { MonitoringHealthStatusBar } from './MonitoringHealthStatusBar';
 import {
   buildAccountSecondaryText,
   buildAccountSummaryMetrics,
+  buildCacheTokenPresentation,
+  formatAccountQuotaResetDisplay,
   formatPercent,
   getAccountStatusDotClassName,
   getAccountStatusLabel,
@@ -220,7 +222,7 @@ function AccountQuotaPanel({
               <span className={styles.quotaProgressBar} style={barStyle} />
             </div>
             <div className={styles.quotaWindowMeta}>
-              <small>{`${t('monitoring.account_quota_reset_at')}: ${window.resetLabel}`}</small>
+              <small>{`${t('monitoring.account_quota_reset_at')}: ${formatAccountQuotaResetDisplay(window.resetAtMs, window.resetLabel)}`}</small>
               {window.usageLabel ? <small>{window.usageLabel}</small> : null}
             </div>
           </div>
@@ -595,6 +597,7 @@ function AccountModelUsageList({
           {visibleModels.map((model) => {
             const modelKey = `${row.id}-${model.model}`;
             const isModelExpanded = Boolean(expandedModels[modelKey]);
+            const cacheMetric = buildCacheTokenPresentation(model, t);
             return (
               <div key={modelKey} className={styles.accountModelItem}>
                 <button
@@ -653,14 +656,8 @@ function AccountModelUsageList({
                       <strong>{formatCompactNumber(model.outputTokens)}</strong>
                     </div>
                     <div className={styles.accountModelExpandedItem}>
-                      <small>
-                        {shortLabel(
-                          t,
-                          'monitoring.cached_tokens_short',
-                          'monitoring.cached_tokens'
-                        )}
-                      </small>
-                      <strong>{formatCompactNumber(model.cachedTokens)}</strong>
+                      <small title={cacheMetric.fullLabel}>{cacheMetric.label}</small>
+                      <strong>{cacheMetric.value}</strong>
                     </div>
                     <div className={styles.accountModelExpandedItem}>
                       <small>
@@ -743,25 +740,35 @@ export function AccountModelUsageTable({
             </tr>
           </thead>
           <tbody>
-            {visibleModels.map((model) => (
-              <tr key={`${row.id}-${model.model}`}>
-                <td>
-                  <span className={styles.accountModelName} title={model.model}>
-                    {model.model}
-                  </span>
-                </td>
-                <td>{formatCompactNumber(model.totalCalls)}</td>
-                <td className={getSuccessRateClassName(model.successRate)}>
-                  {formatPercent(model.successRate)}
-                </td>
-                <td>{formatCompactNumber(model.inputTokens)}</td>
-                <td>{formatCompactNumber(model.outputTokens)}</td>
-                <td>{formatCompactNumber(model.cachedTokens)}</td>
-                <td>{formatCompactNumber(model.totalTokens)}</td>
-                <td>{hasPrices ? formatUsd(model.totalCost) : '--'}</td>
-                <td>{new Date(model.lastSeenAt).toLocaleString(locale)}</td>
-              </tr>
-            ))}
+            {visibleModels.map((model) => {
+              const cacheMetric = buildCacheTokenPresentation(model, t);
+              return (
+                <tr key={`${row.id}-${model.model}`}>
+                  <td>
+                    <span className={styles.accountModelName} title={model.model}>
+                      {model.model}
+                    </span>
+                  </td>
+                  <td>{formatCompactNumber(model.totalCalls)}</td>
+                  <td className={getSuccessRateClassName(model.successRate)}>
+                    {formatPercent(model.successRate)}
+                  </td>
+                  <td>{formatCompactNumber(model.inputTokens)}</td>
+                  <td>{formatCompactNumber(model.outputTokens)}</td>
+                  <td>
+                    <span title={cacheMetric.fullLabel}>
+                      {cacheMetric.label ===
+                      shortLabel(t, 'monitoring.cached_tokens_short', 'monitoring.cached_tokens')
+                        ? cacheMetric.value
+                        : `${cacheMetric.label} ${cacheMetric.value}`}
+                    </span>
+                  </td>
+                  <td>{formatCompactNumber(model.totalTokens)}</td>
+                  <td>{hasPrices ? formatUsd(model.totalCost) : '--'}</td>
+                  <td>{new Date(model.lastSeenAt).toLocaleString(locale)}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       ) : (

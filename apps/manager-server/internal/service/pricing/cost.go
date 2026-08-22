@@ -14,6 +14,8 @@ const PerMillion = 1_000_000.0
 // CachedTokens is the remaining legacy/OpenAI-style cached input after any
 // fine-grained cache_read/cache_creation values have already been removed.
 type ModelTokens struct {
+	PricingModel            string
+	ContextThresholdTokens  int64
 	InputTokens             int64
 	OutputTokens            int64
 	CachedTokens            int64
@@ -27,8 +29,9 @@ type ModelTokens struct {
 }
 
 // CostForModel computes the dollar cost for a single (model, tokens) pair.
-// When CPA provides fine-grained cache read/create tokens, input tokens are
-// treated as non-cache input and those cache dimensions are priced separately.
+// InputTokens is the normalized total input, including cache buckets when the
+// upstream protocol reports them separately. Fine-grained cache read/create
+// dimensions are removed from prompt input and priced separately.
 // Any residual CachedTokens are still charged at the legacy cache price; callers
 // must pass the compatibility cached value, not CPA's Claude mirror copy.
 // Older payloads keep the OpenAI-style cached-in-input behavior.
@@ -41,34 +44,41 @@ func CostForModel(modelName string, tokens ModelTokens, prices map[string]model.
 }
 
 func costForPrice(modelName string, tokens ModelTokens, price model.ModelPrice) float64 {
-	if isGPT56Model(modelName) {
-		return costForGPT56(tokens, enrichGPT56BasePrice(modelName, price))
-	}
-
-	inputTokens := maxInt64(tokens.InputTokens, 0)
-	outputTokens := maxInt64(tokens.OutputTokens, 0)
-	cachedTokens := maxInt64(tokens.CachedTokens, 0)
-	cacheReadTokens := maxInt64(tokens.CacheReadTokens, 0)
-	cacheCreationTokens := maxInt64(tokens.CacheCreationTokens, 0)
-	if cacheReadTokens > 0 || cacheCreationTokens > 0 {
-		promptTokens := maxInt64(inputTokens-cachedTokens, 0)
-		cacheReadPrice := fallbackPrice(price.CacheRead, price.Cache)
-		cacheCreationPrice := fallbackPrice(price.CacheCreation, price.Prompt)
-		return float64(promptTokens)*price.Prompt/PerMillion +
-			float64(outputTokens)*price.Completion/PerMillion +
-			float64(cachedTokens)*price.Cache/PerMillion +
-			float64(cacheReadTokens)*cacheReadPrice/PerMillion +
-			float64(cacheCreationTokens)*cacheCreationPrice/PerMillion
-	}
-
-	promptTokens := maxInt64(inputTokens-cachedTokens, 0)
-
-	return float64(promptTokens)*price.Prompt/PerMillion +
-		float64(outputTokens)*price.Completion/PerMillion +
-		float64(cachedTokens)*price.Cache/PerMillion
+	return costForPriceWithLegacyLongContext(modelName, tokens, price, true)
 }
 
-func costForGPT56(tokens ModelTokens, price model.ModelPrice) float64 {
+func costForPriceWithLegacyLongContext(modelName string, tokens ModelTokens, price model.ModelPrice, allowLegacyLongContext bool) float64 {
+	if isGPT56Model(modelName) {
+		price = enrichGPT56BasePrice(modelName, price)
+	}
+	if effectivePrice, ok := activeContextPrice(tokens, price); ok {
+		return costForSegment(
+			maxInt64(tokens.InputTokens, 0),
+			maxInt64(tokens.OutputTokens, 0),
+			maxInt64(tokens.CachedTokens, 0),
+			maxInt64(tokens.CacheReadTokens, 0),
+			maxInt64(tokens.CacheCreationTokens, 0),
+			effectivePrice,
+			1,
+			1,
+		)
+	}
+	if allowLegacyLongContext && supportsLongContextPremium(modelName) {
+		return costForLongContextModel(tokens, price)
+	}
+	return costForSegment(
+		maxInt64(tokens.InputTokens, 0),
+		maxInt64(tokens.OutputTokens, 0),
+		maxInt64(tokens.CachedTokens, 0),
+		maxInt64(tokens.CacheReadTokens, 0),
+		maxInt64(tokens.CacheCreationTokens, 0),
+		price,
+		1,
+		1,
+	)
+}
+
+func costForLongContextModel(tokens ModelTokens, price model.ModelPrice) float64 {
 	inputTokens := maxInt64(tokens.InputTokens, 0)
 	outputTokens := maxInt64(tokens.OutputTokens, 0)
 	cachedTokens := maxInt64(tokens.CachedTokens, 0)
@@ -81,7 +91,7 @@ func costForGPT56(tokens ModelTokens, price model.ModelPrice) float64 {
 	longCacheReadTokens := clampTokens(tokens.LongCacheReadTokens, cacheReadTokens)
 	longCacheCreationTokens := clampTokens(tokens.LongCacheCreationTokens, cacheCreationTokens)
 
-	shortCost := costForGPT56Segment(
+	shortCost := costForSegment(
 		inputTokens-longInputTokens,
 		outputTokens-longOutputTokens,
 		cachedTokens-longCachedTokens,
@@ -91,7 +101,7 @@ func costForGPT56(tokens ModelTokens, price model.ModelPrice) float64 {
 		1,
 		1,
 	)
-	longCost := costForGPT56Segment(
+	longCost := costForSegment(
 		longInputTokens,
 		longOutputTokens,
 		longCachedTokens,
@@ -104,7 +114,7 @@ func costForGPT56(tokens ModelTokens, price model.ModelPrice) float64 {
 	return shortCost + longCost
 }
 
-func costForGPT56Segment(
+func costForSegment(
 	inputTokens int64,
 	outputTokens int64,
 	cachedTokens int64,
@@ -118,15 +128,16 @@ func costForGPT56Segment(
 	promptTokens := maxInt64(inputTokens-readTokens-cacheCreationTokens, 0)
 	cacheReadPrice := price.CacheRead
 	if !configuredPriceValue(cacheReadPrice, price.CacheReadConfigured) {
-		cacheReadPrice = price.Prompt * 0.1
+		cacheReadPrice = fallbackPrice(price.Cache, price.Prompt*0.1)
 	}
 	cacheCreationPrice := price.CacheCreation
 	if !configuredPriceValue(cacheCreationPrice, price.CacheCreationConfigured) {
-		cacheCreationPrice = price.Prompt * 1.25
+		cacheCreationPrice = price.Prompt
 	}
 
 	return float64(promptTokens)*price.Prompt*inputMultiplier/PerMillion +
-		float64(readTokens)*cacheReadPrice*inputMultiplier/PerMillion +
+		float64(cachedTokens)*price.Cache*inputMultiplier/PerMillion +
+		float64(cacheReadTokens)*cacheReadPrice*inputMultiplier/PerMillion +
 		float64(cacheCreationTokens)*cacheCreationPrice*inputMultiplier/PerMillion +
 		float64(outputTokens)*price.Completion*outputMultiplier/PerMillion
 }
@@ -137,6 +148,9 @@ func costForGPT56Segment(
 // per-tier prices such as standard, priority, flex, and batch.
 func ServiceTierMultiplier(modelName string, serviceTier string) float64 {
 	tier := strings.ToLower(strings.TrimSpace(serviceTier))
+	if tier == "flex" || tier == "batch" {
+		return 0.5
+	}
 	if tier != "priority" && tier != "fast" {
 		return 1
 	}
@@ -158,10 +172,14 @@ func ServiceTierMultiplier(modelName string, serviceTier string) float64 {
 	}
 }
 
-// CostForModelWithServiceTier computes standard token cost first, then applies
-// the multiplier for the actual service_tier recorded by usage.
+// CostForModelWithServiceTier selects context or explicit service-tier prices
+// before falling back to the compatibility multiplier for older price books.
 func CostForModelWithServiceTier(modelName string, serviceTier string, tokens ModelTokens, prices map[string]model.ModelPrice) float64 {
-	return CostForModel(modelName, tokens, prices) * ServiceTierMultiplier(modelName, serviceTier)
+	price, ok := resolveModelPrice(modelName, prices)
+	if !ok {
+		return 0
+	}
+	return costForPriceWithServiceTier(modelName, serviceTier, tokens, price)
 }
 
 // CostForModelCandidatesWithServiceTier uses the first candidate to determine
@@ -183,19 +201,24 @@ func CostForModelCandidatesWithServiceTier(modelNames []string, serviceTier stri
 	if len(candidates) > 0 {
 		behaviorModel = candidates[0]
 	}
+	if pricingModel := strings.TrimSpace(tokens.PricingModel); pricingModel != "" {
+		if price, ok := prices[pricingModel]; ok {
+			return costForPriceWithServiceTier(behaviorModel, serviceTier, tokens, price)
+		}
+	}
 	for _, modelName := range candidates {
 		price, ok := prices[modelName]
 		if !ok {
 			continue
 		}
-		return costForPrice(behaviorModel, tokens, price) * ServiceTierMultiplier(behaviorModel, serviceTier)
+		return costForPriceWithServiceTier(behaviorModel, serviceTier, tokens, price)
 	}
 	for _, modelName := range candidates {
 		price, ok := officialGPT56Price(modelName)
 		if !ok {
 			continue
 		}
-		return costForPrice(behaviorModel, tokens, price) * ServiceTierMultiplier(behaviorModel, serviceTier)
+		return costForPriceWithServiceTier(behaviorModel, serviceTier, tokens, price)
 	}
 	return 0
 }
@@ -238,6 +261,86 @@ func isGPT56Model(modelName string) bool {
 	return isModelFamily(modelName, "gpt-5.6")
 }
 
+func supportsLongContextPremium(modelName string) bool {
+	slug := normalizedModelSlug(modelName)
+	if isGPT56Model(slug) {
+		return true
+	}
+	if slug == "gpt-5.5" || strings.HasPrefix(slug, "gpt-5.5-20") {
+		return true
+	}
+	return slug == "gpt-5.4" || strings.HasPrefix(slug, "gpt-5.4-20") ||
+		slug == "gpt-5.4-pro" || strings.HasPrefix(slug, "gpt-5.4-pro-20")
+}
+
+func costForPriceWithServiceTier(modelName, serviceTier string, tokens ModelTokens, price model.ModelPrice) float64 {
+	if activeContextTier(tokens, price) {
+		return costForPrice(modelName, tokens, price)
+	}
+	legacyLongContext := len(price.ContextTiers) == 0 && supportsLongContextPremium(modelName) && tokens.LongInputTokens > 0
+	if legacyLongContext {
+		tier := strings.ToLower(strings.TrimSpace(serviceTier))
+		if tier != "priority" && tier != "fast" {
+			if effectivePrice, ok := model.ModelPriceForServiceTier(price, serviceTier); ok {
+				return costForPriceWithLegacyLongContext(modelName, tokens, effectivePrice, true)
+			}
+			return costForPrice(modelName, tokens, price) * ServiceTierMultiplier(modelName, serviceTier)
+		}
+		shortTokens, longTokens := splitLegacyLongContextTokens(tokens)
+		longCost := costForPriceWithLegacyLongContext(modelName, longTokens, price, true)
+		if effectivePrice, ok := model.ModelPriceForServiceTier(price, serviceTier); ok {
+			return costForPriceWithLegacyLongContext(modelName, shortTokens, effectivePrice, false) + longCost
+		}
+		return costForPriceWithLegacyLongContext(modelName, shortTokens, price, false)*ServiceTierMultiplier(modelName, serviceTier) + longCost
+	}
+	if effectivePrice, ok := model.ModelPriceForServiceTier(price, serviceTier); ok {
+		return costForPriceWithLegacyLongContext(modelName, tokens, effectivePrice, len(price.ContextTiers) == 0)
+	}
+	return costForPrice(modelName, tokens, price) * ServiceTierMultiplier(modelName, serviceTier)
+}
+
+func splitLegacyLongContextTokens(tokens ModelTokens) (ModelTokens, ModelTokens) {
+	longTokens := ModelTokens{
+		PricingModel:        tokens.PricingModel,
+		InputTokens:         clampTokens(tokens.LongInputTokens, maxInt64(tokens.InputTokens, 0)),
+		OutputTokens:        clampTokens(tokens.LongOutputTokens, maxInt64(tokens.OutputTokens, 0)),
+		CachedTokens:        clampTokens(tokens.LongCachedTokens, maxInt64(tokens.CachedTokens, 0)),
+		CacheReadTokens:     clampTokens(tokens.LongCacheReadTokens, maxInt64(tokens.CacheReadTokens, 0)),
+		CacheCreationTokens: clampTokens(tokens.LongCacheCreationTokens, maxInt64(tokens.CacheCreationTokens, 0)),
+	}
+	longTokens.LongInputTokens = longTokens.InputTokens
+	longTokens.LongOutputTokens = longTokens.OutputTokens
+	longTokens.LongCachedTokens = longTokens.CachedTokens
+	longTokens.LongCacheReadTokens = longTokens.CacheReadTokens
+	longTokens.LongCacheCreationTokens = longTokens.CacheCreationTokens
+
+	shortTokens := ModelTokens{
+		PricingModel:        tokens.PricingModel,
+		InputTokens:         maxInt64(tokens.InputTokens, 0) - longTokens.InputTokens,
+		OutputTokens:        maxInt64(tokens.OutputTokens, 0) - longTokens.OutputTokens,
+		CachedTokens:        maxInt64(tokens.CachedTokens, 0) - longTokens.CachedTokens,
+		CacheReadTokens:     maxInt64(tokens.CacheReadTokens, 0) - longTokens.CacheReadTokens,
+		CacheCreationTokens: maxInt64(tokens.CacheCreationTokens, 0) - longTokens.CacheCreationTokens,
+	}
+	return shortTokens, longTokens
+}
+
+func activeContextTier(tokens ModelTokens, price model.ModelPrice) bool {
+	if tokens.ContextThresholdTokens <= 0 {
+		return false
+	}
+	_, ok := model.ModelPriceForContextThreshold(price, tokens.ContextThresholdTokens)
+	return ok
+}
+
+func activeContextPrice(tokens ModelTokens, price model.ModelPrice) (model.ModelPrice, bool) {
+	if len(price.ContextTiers) == 0 || tokens.ContextThresholdTokens == 0 {
+		return model.ModelPrice{}, false
+	}
+	effective, ok := model.ModelPriceForContextThreshold(price, tokens.ContextThresholdTokens)
+	return effective, ok
+}
+
 func resolveModelPrice(modelName string, prices map[string]model.ModelPrice) (model.ModelPrice, bool) {
 	if price, ok := prices[modelName]; ok {
 		return price, true
@@ -255,6 +358,12 @@ func enrichGPT56BasePrice(modelName string, price model.ModelPrice) model.ModelP
 	}
 	if !configuredPriceValue(price.Completion, price.CompletionConfigured) {
 		price.Completion = fallback.Completion
+	}
+	if !configuredPriceValue(price.CacheRead, price.CacheReadConfigured) {
+		price.CacheRead = price.Prompt * 0.1
+	}
+	if !configuredPriceValue(price.CacheCreation, price.CacheCreationConfigured) {
+		price.CacheCreation = price.Prompt * 1.25
 	}
 	return price
 }
