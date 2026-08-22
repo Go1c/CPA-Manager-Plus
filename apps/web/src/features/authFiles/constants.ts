@@ -25,6 +25,7 @@ export type AuthFileModelItem = {
 export type AuthFileIconAsset = string | { light: string; dark: string };
 
 export type QuotaProviderType = 'antigravity' | 'claude' | 'codex' | 'kimi' | 'xai';
+export type OAuthConfigLoadState = 'loading' | 'ready' | 'unsupported' | 'error';
 
 export const QUOTA_PROVIDER_TYPES = new Set<QuotaProviderType>([
   'antigravity',
@@ -34,14 +35,25 @@ export const QUOTA_PROVIDER_TYPES = new Set<QuotaProviderType>([
   'xai',
 ]);
 
-export const MIN_CARD_PAGE_SIZE = 3;
-export const MAX_CARD_PAGE_SIZE = 30;
 export const AUTH_FILE_REFRESH_WARNING_MS = 24 * 60 * 60 * 1000;
+
+export const AUTH_FILE_HEALTHY_STATUS_MESSAGES = new Set([
+  'ok',
+  'healthy',
+  'ready',
+  'success',
+  'available',
+]);
+
+export const isHealthyAuthFileStatusMessage = (value: string): boolean =>
+  AUTH_FILE_HEALTHY_STATUS_MESSAGES.has(value.trim().toLowerCase());
 
 export const INTEGER_STRING_PATTERN = /^[+-]?\d+$/;
 export const TRUTHY_TEXT_VALUES = new Set(['true', '1', 'yes', 'y', 'on']);
 export const FALSY_TEXT_VALUES = new Set(['false', '0', 'no', 'n', 'off']);
 export const AUTH_FILE_WEBSOCKET_PROVIDERS = new Set(['codex', 'xai']);
+export const supportsAuthFileUsingApi = (provider: string) =>
+  normalizeProviderKey(provider) === 'xai';
 
 // 标签类型颜色配置 — 基于各提供商 Logo 品牌色调配，确保彼此不重复
 export const TYPE_COLORS: Record<string, TypeColorSet> = {
@@ -118,9 +130,6 @@ export const AUTH_FILE_ICONS: Record<string, AuthFileIconAsset> = {
   vertex: iconVertex,
 };
 
-export const clampCardPageSize = (value: number) =>
-  Math.min(MAX_CARD_PAGE_SIZE, Math.max(MIN_CARD_PAGE_SIZE, Math.round(value)));
-
 export const resolveQuotaErrorMessage = (
   t: TFunction,
   status: number | undefined,
@@ -135,6 +144,23 @@ export const normalizeProviderKey = (value: string) => {
   const key = value.trim().toLowerCase().replace(/_/g, '-');
   if (key === 'x-ai' || key === 'grok') return 'xai';
   return key;
+};
+
+export const getEquivalentProviderKeys = (value: string): string[] => {
+  const providerKey = normalizeProviderKey(value);
+  if (!providerKey) return [];
+  if (providerKey === 'gemini') return ['gemini', 'gemini-cli'];
+  if (providerKey === 'gemini-cli') return ['gemini-cli', 'gemini'];
+  return [providerKey];
+};
+
+export const getProviderRecordValues = <T>(record: Record<string, T>, provider: string): T[] => {
+  const providerKeys = getEquivalentProviderKeys(provider);
+  if (providerKeys.length === 0) return [];
+  const entries = Object.entries(record);
+  return providerKeys.flatMap((providerKey) =>
+    entries.filter(([key]) => normalizeProviderKey(key) === providerKey).map(([, value]) => value)
+  );
 };
 
 export const getAuthFileStatusMessage = (file: AuthFileItem): string => {
@@ -251,7 +277,7 @@ export const formatModified = (item: AuthFileItem): string => {
   const date =
     Number.isFinite(asNumber) && !Number.isNaN(asNumber)
       ? new Date(asNumber < 1e12 ? asNumber * 1000 : asNumber)
-      : parseTimestamp(raw) ?? new Date(String(raw));
+      : (parseTimestamp(raw) ?? new Date(String(raw)));
   return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString();
 };
 
@@ -261,8 +287,7 @@ export const isModelExcluded = (
   providerType: string,
   excluded: Record<string, string[]>
 ): boolean => {
-  const providerKey = normalizeProviderKey(providerType);
-  const excludedModels = excluded[providerKey] || excluded[providerType] || [];
+  const excludedModels = getProviderRecordValues(excluded, providerType).flat();
   return excludedModels.some((pattern) => {
     if (pattern.includes('*')) {
       // 支持通配符匹配：先转义正则特殊字符，再将 * 视为通配符

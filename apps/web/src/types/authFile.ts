@@ -20,6 +20,7 @@ export type AuthFileType =
   | 'unknown';
 
 export interface AuthFileItem {
+  id?: string;
   name: string;
   type?: AuthFileType | string;
   provider?: string;
@@ -27,6 +28,7 @@ export interface AuthFileItem {
   authIndex?: string | number | null;
   runtimeOnly?: boolean | string;
   disabled?: boolean;
+  weight?: number;
   unavailable?: boolean;
   status?: string;
   statusMessage?: string;

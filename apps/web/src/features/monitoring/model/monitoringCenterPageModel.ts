@@ -42,8 +42,12 @@ import {
   fetchKimiQuota,
   fetchXaiQuota,
   buildCodexQuotaWindowInfos,
+  filterFreshCodexQuotaWindows,
   formatKimiResetHint,
   formatQuotaResetTime,
+  resolveAbsoluteQuotaReset,
+  findCodexProviderWindowMatch,
+  resolveCodexUsageQuotaScope,
 } from '@/utils/quota';
 import {
   buildObservedCodexQuotaFromHeaderSnapshot,
@@ -55,7 +59,9 @@ import {
   getHeaderSnapshotUsedPercent,
   hasUsageHeaderQuotaSignal,
 } from '@/utils/usageHeaderSnapshots';
+import { formatXaiBillingDiagnostics } from '@/utils/quota/xaiPresentation';
 import {
+  calculateCacheHitRateFromTotals,
   formatCompactNumber,
   formatDurationMs,
   formatUsd,
@@ -158,6 +164,7 @@ export const buildMonitoringInitialStateFromQuery = (
   const status = params.get('status')?.trim();
   const provider = params.get('provider')?.trim();
   const authFile = params.get('auth_file')?.trim();
+  const authIndex = params.get('auth_index')?.trim();
   const projectId = params.get('project_id')?.trim();
   const requestType = params.get('request_type')?.trim();
   const searchQuery = params.get('search')?.trim();
@@ -167,6 +174,7 @@ export const buildMonitoringInitialStateFromQuery = (
   const hasRange = fromMs !== null && toMs !== null && fromMs < toMs;
   const hasStructuredScopeFilter = Boolean(
     authFile ||
+    authIndex ||
     projectId ||
     requestType ||
     minLatencyMs ||
@@ -636,12 +644,17 @@ export const buildSecondarySummaryCards = (
 ): SummaryCardProps[] => {
   const totalCacheTokens =
     summary.cachedTokens + summary.cacheCreationTokens + summary.cacheReadTokens;
-  const cacheHitTokens = summary.cachedTokens + summary.cacheReadTokens;
-  const inputSideTokens =
+  const fallbackCacheInputTokens =
     Math.max(summary.inputTokens, summary.cachedTokens) +
     summary.cacheReadTokens +
     summary.cacheCreationTokens;
-  const cacheHitRate = inputSideTokens > 0 ? cacheHitTokens / inputSideTokens : 0;
+  const cacheHitRate =
+    summary.cacheHitRate === undefined
+      ? calculateCacheHitRateFromTotals(
+          summary.cachedTokens + summary.cacheReadTokens,
+          fallbackCacheInputTokens
+        )
+      : calculateCacheHitRateFromTotals(summary.cacheHitRate, 1);
 
   return [
     {
@@ -789,7 +802,11 @@ const buildCodexAccountQuotaWindows = (
         : window.label,
       remainingPercent,
       resetLabel: window.resetLabel,
+      resetAtMs: window.resetAtMs ?? null,
+      resetAccuracy: window.resetAccuracy ?? 'unknown',
       usageLabel,
+      modelScope: window.modelScope,
+      providerWindowAliases: window.providerWindowAliases,
     };
   });
 
@@ -805,21 +822,44 @@ const readFiniteTimestamp = (value: unknown): number | null =>
 const mergeAccountQuotaWindow = (
   activeWindow: AccountQuotaWindow,
   observedWindow: AccountQuotaWindow
-): AccountQuotaWindow => ({
-  ...activeWindow,
-  ...(observedWindow.label.trim() ? { label: observedWindow.label } : {}),
-  ...(observedWindow.remainingPercent !== null &&
-  observedWindow.remainingPercent !== undefined &&
-  Number.isFinite(observedWindow.remainingPercent)
-    ? { remainingPercent: observedWindow.remainingPercent }
-    : {}),
-  ...(hasKnownAccountQuotaResetLabel(observedWindow.resetLabel)
-    ? { resetLabel: observedWindow.resetLabel }
-    : {}),
-  ...(observedWindow.usageLabel && observedWindow.usageLabel.trim()
-    ? { usageLabel: observedWindow.usageLabel }
-    : {}),
-});
+): AccountQuotaWindow => {
+  const hasObservedResetAt =
+    typeof observedWindow.resetAtMs === 'number' &&
+    Number.isFinite(observedWindow.resetAtMs) &&
+    observedWindow.resetAtMs > 0;
+  const hasObservedResetLabel = hasKnownAccountQuotaResetLabel(observedWindow.resetLabel);
+  const resetMetadata = hasObservedResetAt
+    ? {
+        resetLabel: hasObservedResetLabel ? observedWindow.resetLabel : activeWindow.resetLabel,
+        resetAtMs: observedWindow.resetAtMs,
+        resetAccuracy: observedWindow.resetAccuracy,
+      }
+    : hasObservedResetLabel
+      ? {
+          resetLabel: observedWindow.resetLabel,
+          resetAtMs: null,
+          resetAccuracy: 'unknown' as const,
+        }
+      : {};
+
+  return {
+    ...activeWindow,
+    ...(observedWindow.label.trim() ? { label: observedWindow.label } : {}),
+    ...(observedWindow.remainingPercent !== null &&
+    observedWindow.remainingPercent !== undefined &&
+    Number.isFinite(observedWindow.remainingPercent)
+      ? { remainingPercent: observedWindow.remainingPercent }
+      : {}),
+    ...resetMetadata,
+    ...(observedWindow.usageLabel && observedWindow.usageLabel.trim()
+      ? { usageLabel: observedWindow.usageLabel }
+      : {}),
+    ...(observedWindow.modelScope ? { modelScope: observedWindow.modelScope } : {}),
+    ...(observedWindow.providerWindowAliases
+      ? { providerWindowAliases: observedWindow.providerWindowAliases }
+      : {}),
+  };
+};
 
 const mergeAccountQuotaWindows = (
   activeWindows: AccountQuotaWindow[],
@@ -828,15 +868,35 @@ const mergeAccountQuotaWindows = (
   if (observedWindows.length === 0) return activeWindows;
   if (activeWindows.length === 0) return observedWindows;
 
-  const observedById = new Map(observedWindows.map((window) => [window.id, window]));
-  const mergedWindows = activeWindows.map((window) => {
-    const observedWindow = observedById.get(window.id);
-    if (!observedWindow) return window;
-    observedById.delete(window.id);
-    return mergeAccountQuotaWindow(window, observedWindow);
+  const usedObserved = new Set<number>();
+  const mergedWindows = activeWindows.map((window, activeIndex) => {
+    const observedIndex = findCodexProviderWindowMatch(
+      activeWindows,
+      observedWindows,
+      activeIndex,
+      usedObserved
+    );
+    if (observedIndex < 0) return window;
+    usedObserved.add(observedIndex);
+    const observedWindow = observedWindows[observedIndex];
+    const aliases = Array.from(
+      new Set([
+        ...(window.providerWindowAliases ?? []),
+        ...(observedWindow.providerWindowAliases ?? []),
+        window.id,
+      ])
+    ).filter((alias) => alias && alias !== observedWindow.id);
+    return {
+      ...mergeAccountQuotaWindow(window, observedWindow),
+      id: observedWindow.id,
+      ...(aliases.length > 0 ? { providerWindowAliases: aliases } : {}),
+    };
   });
 
-  return [...mergedWindows, ...observedById.values()];
+  return [
+    ...mergedWindows,
+    ...observedWindows.filter((_, index) => !usedObserved.has(index)),
+  ];
 };
 
 const mergeAccountQuotaMetaLabels = (
@@ -947,9 +1007,20 @@ export const mergeObservedAccountQuotaState = (
   targets: MonitoringAccountQuotaTarget[],
   observedEntries: AccountQuotaEntry[]
 ): AccountQuotaState | undefined => {
-  if (!state || state.status === 'loading' || observedEntries.length === 0) return state;
+  if (state?.status === 'loading' || observedEntries.length === 0) return state;
 
   const targetKey = targets.map((target) => target.key).join('|');
+  if (!state) {
+    const targetKeys = new Set(targets.map((target) => target.key));
+    const entries = observedEntries.filter((entry) => targetKeys.has(entry.key));
+    if (entries.length === 0) return state;
+    return {
+      status: 'success',
+      targetKey,
+      entries,
+      error: '',
+    };
+  }
   if (state.targetKey !== targetKey) return state;
 
   const observedByKey = new Map(observedEntries.map((entry) => [entry.key, entry]));
@@ -974,7 +1045,10 @@ export const mergeObservedAccountQuotaState = (
   observedEntries.forEach((observedEntry) => {
     if (!targetKeys.has(observedEntry.key) || activeKeys.has(observedEntry.key)) return;
 
-    if (state.status === 'error' && !isObservedAccountQuotaNewerThanFailure(state.failedAtMs, observedEntry)) {
+    if (
+      state.status === 'error' &&
+      !isObservedAccountQuotaNewerThanFailure(state.failedAtMs, observedEntry)
+    ) {
       if (!state.error) return;
       entries.push({ ...observedEntry, error: state.error, failedAtMs: state.failedAtMs });
     } else {
@@ -1004,37 +1078,28 @@ const buildClaudeAccountQuotaWindows = (
     label: window.labelKey ? t(window.labelKey) : window.label,
     remainingPercent: buildRemainingFromUsedPercent(window.usedPercent),
     resetLabel: window.resetLabel,
+    resetAtMs: window.resetAtMs ?? null,
+    resetAccuracy: window.resetAccuracy ?? 'unknown',
     usageLabel: null,
   }));
 
 const buildAntigravityAccountQuotaWindows = (
   groups: AntigravityQuotaGroup[]
 ): AccountQuotaWindow[] =>
-  groups
-    .map((group): AccountQuotaWindow | null => {
-      if (group.buckets.length === 0) return null;
-      const remainingFraction = Math.min(
-        ...group.buckets.map((bucket) => bucket.remainingFraction)
-      );
-      const resetTime = group.buckets.reduce<string | undefined>((current, bucket) => {
-        if (!current) return bucket.resetTime;
-        if (!bucket.resetTime) return current;
-        const currentTime = new Date(current).getTime();
-        const nextTime = new Date(bucket.resetTime).getTime();
-        if (Number.isNaN(currentTime)) return bucket.resetTime;
-        if (Number.isNaN(nextTime)) return current;
-        return currentTime <= nextTime ? current : bucket.resetTime;
-      }, undefined);
-
+  groups.flatMap((group) =>
+    group.buckets.map((bucket) => {
+      const reset = resolveAbsoluteQuotaReset(bucket.resetTime);
       return {
-        id: group.id,
-        label: group.label,
-        remainingPercent: clampRemainingPercent(remainingFraction * 100),
-        resetLabel: formatQuotaResetTime(resetTime),
-        usageLabel: null,
+        id: `${group.id}:${bucket.id}`,
+        label: `${group.label} · ${bucket.label}`,
+        remainingPercent: clampRemainingPercent(bucket.remainingFraction * 100),
+        resetLabel: formatQuotaResetTime(bucket.resetTime),
+        resetAtMs: reset.resetAtMs,
+        resetAccuracy: reset.resetAccuracy,
+        usageLabel: bucket.description ?? group.description ?? null,
       };
     })
-    .filter((window): window is AccountQuotaWindow => window !== null);
+  );
 
 const buildKimiAccountQuotaWindows = (rows: KimiQuotaRow[], t: TFunction): AccountQuotaWindow[] =>
   rows.map((row) => {
@@ -1056,6 +1121,8 @@ const buildKimiAccountQuotaWindows = (rows: KimiQuotaRow[], t: TFunction): Accou
       label: rowLabel,
       remainingPercent,
       resetLabel: resetLabel || '-',
+      resetAtMs: row.resetAtMs ?? null,
+      resetAccuracy: row.resetAccuracy ?? 'unknown',
       usageLabel: null,
     };
   });
@@ -1074,13 +1141,17 @@ const buildXaiAccountQuotaWindows = (
       ? Math.max(0, billing.monthlyLimitCents - billing.includedUsedCents)
       : null;
   const windows: AccountQuotaWindow[] = [];
+  const weeklyReset = resolveAbsoluteQuotaReset(billing.periodEnd);
+  const monthlyReset = resolveAbsoluteQuotaReset(billing.billingPeriodEnd);
+  // Product usage belongs to the current period window. A billing-period end
+  // is a separate monthly boundary and must not be inferred as its reset.
+  const productReset = weeklyReset;
   const hasWeeklyData =
     billing.periodType === 'weekly' &&
-    (billing.usagePercent !== null || Boolean(billing.periodEnd) || billing.productUsage.length > 0);
-  const hasMonthlyData =
-    billing.monthlyLimitCents !== null ||
-    billing.usedCents !== null ||
-    Boolean(billing.billingPeriodEnd);
+    (billing.usagePercent !== null ||
+      Boolean(billing.periodEnd) ||
+      billing.productUsage.length > 0);
+  const hasMonthlyData = billing.usedPercent !== null || billing.monthlyLimitCents !== null;
 
   if (hasWeeklyData) {
     windows.push({
@@ -1088,6 +1159,8 @@ const buildXaiAccountQuotaWindows = (
       label: t('xai_quota.weekly_limit'),
       remainingPercent: buildRemainingFromUsedPercent(billing.usagePercent),
       resetLabel: billing.periodEnd ? formatQuotaResetTime(billing.periodEnd) : '-',
+      resetAtMs: weeklyReset.resetAtMs,
+      resetAccuracy: weeklyReset.resetAccuracy,
       usageLabel: t('xai_quota.used_percent', {
         percent: billing.usagePercent === null ? '--' : `${Math.round(billing.usagePercent)}%`,
       }),
@@ -1099,7 +1172,10 @@ const buildXaiAccountQuotaWindows = (
       id: `product-${index}-${item.product}`,
       label: t('xai_quota.product_usage', { product: item.product }),
       remainingPercent: buildRemainingFromUsedPercent(item.usagePercent),
-      resetLabel: '-',
+      resetLabel:
+        productReset.resetAtMs !== null ? formatQuotaResetTime(productReset.resetAtMs) : '-',
+      resetAtMs: productReset.resetAtMs,
+      resetAccuracy: productReset.resetAccuracy,
       usageLabel: t('xai_quota.used_percent', {
         percent: item.usagePercent === null ? '--' : `${Math.round(item.usagePercent)}%`,
       }),
@@ -1112,6 +1188,8 @@ const buildXaiAccountQuotaWindows = (
       label: t('xai_quota.monthly_credits'),
       remainingPercent: buildRemainingFromUsedPercent(billing.usedPercent),
       resetLabel: billing.billingPeriodEnd ? formatQuotaResetTime(billing.billingPeriodEnd) : '-',
+      resetAtMs: monthlyReset.resetAtMs,
+      resetAccuracy: monthlyReset.resetAccuracy,
       usageLabel: t('xai_quota.usage_amount', {
         remaining: formatXaiCurrency(remainingCents),
         limit: formatXaiCurrency(billing.monthlyLimitCents),
@@ -1128,7 +1206,10 @@ const buildXaiAccountQuotaWindows = (
       id: 'pay-as-you-go',
       label: t('xai_quota.pay_as_you_go_label'),
       remainingPercent: buildRemainingFromUsedPercent(billing.onDemandUsedPercent),
-      resetLabel: '-',
+      resetLabel:
+        monthlyReset.resetAtMs !== null ? formatQuotaResetTime(monthlyReset.resetAtMs) : '-',
+      resetAtMs: monthlyReset.resetAtMs,
+      resetAccuracy: monthlyReset.resetAccuracy,
       usageLabel: t('xai_quota.usage_amount', {
         remaining: formatXaiCurrency(onDemandRemainingCents),
         limit: formatXaiCurrency(billing.onDemandCapCents),
@@ -1210,11 +1291,20 @@ export const buildAccountQuotaErrorEntry = (
 export const buildObservedCodexAccountQuotaEntry = (
   target: MonitoringAccountQuotaTarget,
   snapshot: UsageHeaderSnapshot | undefined,
-  t: TFunction
+  t: TFunction,
+  nowMs = Date.now()
 ): AccountQuotaEntry | null => {
   if (target.provider !== 'codex' || !hasUsageHeaderQuotaSignal(snapshot)) return null;
   const planType = target.planType ?? getHeaderSnapshotPlanType(snapshot) ?? null;
   const observedQuota = buildObservedCodexQuotaFromHeaderSnapshot(snapshot);
+  const observedScope =
+    observedQuota?.quotaScope ??
+    resolveCodexUsageQuotaScope({
+      model: snapshot?.model,
+      analyticsModel: snapshot?.analytics_model,
+      requestedModel: snapshot?.requested_model,
+      resolvedModel: snapshot?.resolved_model,
+    });
   const planLabel = getCodexPlanLabel(planType, t);
   const observedAtMs = readFiniteTimestamp(snapshot?.timestamp_ms) ?? undefined;
   const observedAt = observedAtMs ? new Date(observedAtMs).toLocaleString() : '';
@@ -1226,45 +1316,70 @@ export const buildObservedCodexAccountQuotaEntry = (
   const metaLabels = [
     planLabel ? `${t('codex_quota.plan_label')}: ${planLabel}` : '',
     observedAt
-      ? t('quota_management.observed_from_usage_headers_at', {
+      ? t('monitoring.observed_from_usage_headers_at', {
           time: observedAt,
           defaultValue: `Observed from latest usage response headers · ${observedAt}`,
         })
-      : t('quota_management.observed_from_usage_headers', {
+      : t('monitoring.observed_from_usage_headers', {
           defaultValue: 'Observed from latest usage response headers',
         }),
     [errorKind, errorCode].filter(Boolean).join(' / '),
     traceID ? `Trace: ${traceID}` : '',
   ].filter(Boolean);
 
-  const observedWindows: CodexQuotaWindow[] = observedQuota?.payload
-    ? buildCodexQuotaWindowInfos(observedQuota.payload, { planType }).map((window) => ({
-        id: window.id,
-        label: t(window.labelKey, window.labelParams),
-        labelKey: window.labelKey,
-        labelParams: window.labelParams,
-        usedPercent: window.usedPercent,
-        resetLabel: window.resetLabel,
-        limitWindowSeconds: window.limitWindowSeconds,
-      }))
+  const rawObservedWindowInfos = observedQuota?.payload
+    ? buildCodexQuotaWindowInfos(observedQuota.payload, {
+        planType,
+        observedAtMs,
+        source: 'response_header',
+        rateLimitScope: observedScope,
+      })
     : [];
+  const observedWindows: CodexQuotaWindow[] = filterFreshCodexQuotaWindows(
+    rawObservedWindowInfos,
+    nowMs
+  ).map((window) => ({
+    id: window.id,
+    label: t(window.labelKey, window.labelParams),
+    labelKey: window.labelKey,
+    labelParams: window.labelParams,
+    usedPercent: window.usedPercent,
+    resetLabel: window.resetLabel,
+    resetAtMs: window.resetAtMs,
+    resetAccuracy: window.resetAccuracy,
+    limitWindowSeconds: window.limitWindowSeconds,
+    observationSource: 'response_header',
+    observedAtMs,
+    modelScope: window.modelScope,
+    providerWindowAliases: window.providerWindowAliases,
+  }));
+  const fallbackExpired = recoverAtMS !== null && recoverAtMS <= nowMs;
+  const fallbackUsedPercent = fallbackExpired ? null : usedPercent;
+  const fallbackRecoverAtMS = fallbackExpired ? null : recoverAtMS;
   const windows: AccountQuotaWindow[] =
-    observedWindows.length > 0
+    rawObservedWindowInfos.length > 0
       ? buildCodexAccountQuotaWindows(observedWindows, t)
-      : usedPercent !== null || recoverAtMS
+      : fallbackUsedPercent !== null || fallbackRecoverAtMS
         ? [
             {
-              id: 'usage-header-observed',
+              id: observedScope.providerWindowIdPrefix
+                ? `${observedScope.providerWindowIdPrefix}-observed`
+                : 'usage-header-observed',
               label: t('codex_quota.observed_window', { defaultValue: 'Latest request' }),
-              remainingPercent: buildRemainingFromUsedPercent(usedPercent),
-              resetLabel: recoverAtMS ? new Date(recoverAtMS).toLocaleString() : '-',
+              remainingPercent: buildRemainingFromUsedPercent(fallbackUsedPercent),
+              resetLabel: fallbackRecoverAtMS
+                ? new Date(fallbackRecoverAtMS).toLocaleString()
+                : '-',
+              resetAtMs: fallbackRecoverAtMS,
+              resetAccuracy: fallbackRecoverAtMS ? 'exact' : 'unknown',
               usageLabel:
-                usedPercent !== null
+                fallbackUsedPercent !== null
                   ? t('monitoring.account_quota_observed_used', {
-                      percent: `${Math.round(usedPercent)}%`,
-                      defaultValue: `Observed used ${Math.round(usedPercent)}%`,
+                      percent: `${Math.round(fallbackUsedPercent)}%`,
+                      defaultValue: `Observed used ${Math.round(fallbackUsedPercent)}%`,
                     })
                   : null,
+              modelScope: observedScope.modelScope,
             },
           ]
         : [];
@@ -1308,7 +1423,7 @@ export const requestAccountQuota = async (
       });
     }
     case 'kimi': {
-      const rows = await fetchKimiQuota(target.file, t);
+      const { rows } = await fetchKimiQuota(target.file, t);
       return stampAccountQuotaFetchTime({
         ...buildBaseAccountQuotaEntry(target, t),
         windows: buildKimiAccountQuotaWindows(rows, t),
@@ -1316,13 +1431,24 @@ export const requestAccountQuota = async (
     }
     case 'xai': {
       const billing = await fetchXaiQuota(target.file, t);
-      const metaLabels =
-        billing.onDemandCapCents !== null
-          ? [`${t('xai_quota.on_demand_cap')}: ${formatXaiCurrency(billing.onDemandCapCents)}`]
-          : [];
+      const metaLabels: string[] = [];
+      if (billing.officialApiHealth) {
+        metaLabels.push(t('xai_quota.official_api_health'));
+      } else if (billing.onDemandCapCents !== null) {
+        metaLabels.push(
+          `${t('xai_quota.on_demand_cap')}: ${formatXaiCurrency(billing.onDemandCapCents)}`
+        );
+      }
+      if (billing.partial) {
+        metaLabels.push(
+          t('xai_quota.partial_data', {
+            details: formatXaiBillingDiagnostics(billing.diagnostics, t),
+          })
+        );
+      }
       return stampAccountQuotaFetchTime({
         ...buildBaseAccountQuotaEntry(target, t, metaLabels),
-        windows: buildXaiAccountQuotaWindows(billing, t),
+        windows: billing.officialApiHealth ? [] : buildXaiAccountQuotaWindows(billing, t),
       });
     }
     case 'codex':

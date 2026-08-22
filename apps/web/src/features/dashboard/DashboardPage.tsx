@@ -23,6 +23,7 @@ import { buildMonitoringAuthMetaMap } from '@/features/monitoring/model/authMeta
 import { buildAuthFileMapFromMeta } from '@/features/monitoring/model/sourceDisplay';
 import type { MonitoringChannelMeta } from '@/features/monitoring/model/types';
 import { buildSourceInfoMap } from '@/utils/sourceResolver';
+import { normalizeRoutingStrategy } from '@/utils/routingStrategy';
 import type { AuthFileItem } from '@/types/authFile';
 import { VersionCard } from './components/VersionCard';
 import { UsageMetricsCard } from './components/UsageMetricsCard';
@@ -30,6 +31,8 @@ import { CollectorStatusCard } from './components/CollectorStatusCard';
 import { HealthAlertsCard } from './components/HealthAlertsCard';
 import { TrafficOverviewCard } from './components/TrafficOverviewCard';
 import { useDashboardUsageSummary } from './hooks/useDashboardUsageSummary';
+import { getDashboardModelCountDisplay } from './modelCountDisplay';
+import { resolveProviderCount } from './providerStats';
 import styles from './DashboardPage.module.scss';
 
 interface QuickStat {
@@ -44,6 +47,7 @@ interface QuickStat {
 interface ProviderStats {
   gemini: number | null;
   codex: number | null;
+  xai: number | null;
   claude: number | null;
   openai: number | null;
 }
@@ -69,6 +73,7 @@ export function DashboardPage() {
 
   const models = useModelsStore((state) => state.models);
   const modelsLoading = useModelsStore((state) => state.loading);
+  const modelsError = useModelsStore((state) => state.error);
   const fetchModelsFromStore = useModelsStore((state) => state.fetchModels);
 
   const [stats, setStats] = useState<{
@@ -82,6 +87,7 @@ export function DashboardPage() {
   const [providerStats, setProviderStats] = useState<ProviderStats>({
     gemini: null,
     codex: null,
+    xai: null,
     claude: null,
     openai: null,
   });
@@ -182,12 +188,13 @@ export function DashboardPage() {
     if (connectionStatus === 'connected') {
       setLoading(true);
       try {
-        const [keysRes, filesRes, geminiRes, codexRes, claudeRes, openaiRes] =
+        const [keysRes, filesRes, geminiRes, codexRes, xaiRes, claudeRes, openaiRes] =
           await Promise.allSettled([
             apiKeysApi.list(),
             authFilesApi.list(),
             providersApi.getGeminiKeys(),
             providersApi.getCodexConfigs(),
+            providersApi.getXAIConfigs(),
             providersApi.getClaudeConfigs(),
             providersApi.getOpenAIProviders(),
           ]);
@@ -198,10 +205,11 @@ export function DashboardPage() {
         });
 
         setProviderStats({
-          gemini: geminiRes.status === 'fulfilled' ? geminiRes.value.length : null,
-          codex: codexRes.status === 'fulfilled' ? codexRes.value.length : null,
-          claude: claudeRes.status === 'fulfilled' ? claudeRes.value.length : null,
-          openai: openaiRes.status === 'fulfilled' ? openaiRes.value.length : null,
+          gemini: resolveProviderCount(geminiRes),
+          codex: resolveProviderCount(codexRes),
+          xai: resolveProviderCount(xaiRes, { unsupportedAsZero: true }),
+          claude: resolveProviderCount(claudeRes),
+          openai: resolveProviderCount(openaiRes),
         });
       } finally {
         setLoading(false);
@@ -224,6 +232,7 @@ export function DashboardPage() {
         geminiApiKeys: config?.geminiApiKeys || [],
         claudeApiKeys: config?.claudeApiKeys || [],
         codexApiKeys: config?.codexApiKeys || [],
+        xaiApiKeys: config?.xaiApiKeys || [],
         vertexApiKeys: config?.vertexApiKeys || [],
         openaiCompatibility: config?.openaiCompatibility || [],
       }),
@@ -335,16 +344,19 @@ export function DashboardPage() {
   const providerStatsReady =
     providerStats.gemini !== null &&
     providerStats.codex !== null &&
+    providerStats.xai !== null &&
     providerStats.claude !== null &&
     providerStats.openai !== null;
   const hasProviderStats =
     providerStats.gemini !== null ||
     providerStats.codex !== null ||
+    providerStats.xai !== null ||
     providerStats.claude !== null ||
     providerStats.openai !== null;
   const totalProviderKeys = providerStatsReady
     ? (providerStats.gemini ?? 0) +
       (providerStats.codex ?? 0) +
+      (providerStats.xai ?? 0) +
       (providerStats.claude ?? 0) +
       (providerStats.openai ?? 0)
     : 0;
@@ -368,22 +380,23 @@ export function DashboardPage() {
         ? t('dashboard.provider_keys_detail', {
             gemini: providerStats.gemini ?? '-',
             codex: providerStats.codex ?? '-',
+            xai: providerStats.xai ?? '-',
             claude: providerStats.claude ?? '-',
             openai: providerStats.openai ?? '-',
           })
         : undefined,
     },
     {
-      label: t('nav.auth_files'),
+      label: t('nav.accounts'),
       value: stats.authFiles ?? '-',
       icon: <IconFileText size={24} />,
-      path: '/auth-files',
+      path: '/accounts',
       loading: loading && stats.authFiles === null,
       sublabel: t('dashboard.oauth_credentials'),
     },
     {
       label: t('dashboard.available_models'),
-      value: modelsLoading ? '-' : models.length,
+      value: getDashboardModelCountDisplay(models.length, modelsLoading, modelsError),
       icon: <IconSatellite size={24} />,
       path: '/system',
       loading: modelsLoading,
@@ -392,20 +405,25 @@ export function DashboardPage() {
   ];
 
   const routingStrategyRaw = config?.routingStrategy?.trim() || '';
+  const routingStrategy = normalizeRoutingStrategy(routingStrategyRaw);
   const routingStrategyDisplay = !routingStrategyRaw
     ? '-'
-    : routingStrategyRaw === 'round-robin'
+    : routingStrategy === 'round-robin'
       ? t('basic_settings.routing_strategy_round_robin')
-      : routingStrategyRaw === 'fill-first'
-        ? t('basic_settings.routing_strategy_fill_first')
-        : routingStrategyRaw;
+      : routingStrategy === 'weighted-round-robin'
+        ? t('basic_settings.routing_strategy_weighted_round_robin')
+        : routingStrategy === 'fill-first'
+          ? t('basic_settings.routing_strategy_fill_first')
+          : routingStrategyRaw;
   const routingStrategyBadgeClass = !routingStrategyRaw
     ? styles.configBadgeUnknown
-    : routingStrategyRaw === 'round-robin'
+    : routingStrategy === 'round-robin'
       ? styles.configBadgeRoundRobin
-      : routingStrategyRaw === 'fill-first'
-        ? styles.configBadgeFillFirst
-        : styles.configBadgeUnknown;
+      : routingStrategy === 'weighted-round-robin'
+        ? styles.configBadgeWeightedRoundRobin
+        : routingStrategy === 'fill-first'
+          ? styles.configBadgeFillFirst
+          : styles.configBadgeUnknown;
 
   const formattedDate = currentTime.toLocaleDateString(i18n.language, {
     weekday: 'long',

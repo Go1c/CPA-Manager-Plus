@@ -2,8 +2,39 @@ import i18n from '@/i18n';
 import { maskApiKey } from './format';
 import { normalizeAuthIndex } from './authIndex';
 import { parseTimestampMs } from './timestamp';
+import { normalizeAnalyticsModel } from './analyticsModel';
 
 export { normalizeAuthIndex };
+export { normalizeAnalyticsModel } from './analyticsModel';
+
+export interface ModelPriceContextTier {
+  thresholdTokens: number;
+  prompt: number;
+  completion: number;
+  cache: number;
+  cacheRead?: number;
+  cacheCreation?: number;
+  promptConfigured?: boolean;
+  completionConfigured?: boolean;
+  cacheConfigured?: boolean;
+  cacheReadConfigured?: boolean;
+  cacheCreationConfigured?: boolean;
+}
+
+export interface ModelPriceServiceTier {
+  mode: string;
+  serviceTier: string;
+  prompt: number;
+  completion: number;
+  cache: number;
+  cacheRead?: number;
+  cacheCreation?: number;
+  promptConfigured?: boolean;
+  completionConfigured?: boolean;
+  cacheConfigured?: boolean;
+  cacheReadConfigured?: boolean;
+  cacheCreationConfigured?: boolean;
+}
 
 export interface ModelPrice {
   prompt: number;
@@ -18,6 +49,8 @@ export interface ModelPrice {
   source?: string;
   sourceModelId?: string;
   rawJson?: string;
+  contextTiers?: ModelPriceContextTier[];
+  serviceTiers?: ModelPriceServiceTier[];
   updatedAtMs?: number;
   syncedAtMs?: number;
 }
@@ -39,7 +72,11 @@ export interface UsageTokens {
   cache_write_input_tokens?: number;
   cacheWriteInputTokens?: number;
   total_tokens?: number;
+  cache_input_mode?: CacheInputMode | string;
+  cacheInputMode?: CacheInputMode | string;
 }
+
+export type CacheInputMode = 'included_in_input' | 'separate_from_input';
 
 export interface UsageResponseHeaderQuotaWindow {
   used_percent?: number;
@@ -71,6 +108,7 @@ export interface UsageResponseHeaderMetadata {
     retry_after_seconds?: number;
     retry_after_recover_at_ms?: number;
     rate_limit_bypass?: string;
+    should_retry?: boolean;
   };
   trace?: {
     primary_trace_id?: string;
@@ -82,6 +120,7 @@ export interface UsageResponseHeaderMetadata {
     cloud_ai_companion_trace_id?: string;
     client_request_id?: string;
     zeabur_request_id?: string;
+    traceparent?: string;
   };
   routing?: {
     openai_proxy_wasm?: string;
@@ -108,6 +147,31 @@ export interface UsageResponseHeaderMetadata {
     cloudflare_ray?: string;
     cloudflare_cache_status?: string;
   };
+  rate_limit?: {
+    requests?: { limit?: number; remaining?: number };
+    tokens?: { limit?: number; remaining?: number };
+  };
+  data_policy?: {
+    retention_mode?: string;
+    zero_retention?: boolean;
+  };
+  provider_usage?: {
+    provider?: string;
+    kind?: string;
+    state?: string;
+    code?: string;
+    model?: string;
+    unit?: string;
+    actual?: number;
+    limit?: number;
+    remaining?: number;
+    overage?: number;
+    window_kind?: string;
+    observed_at_ms?: number;
+    recover_at_ms?: number;
+    recover_at_estimated?: boolean;
+    source?: string;
+  };
 }
 
 export interface UsageDetail {
@@ -128,12 +192,33 @@ export interface UsageDetail {
   authProjectIdSnapshot?: string;
   auth_snapshot_at_ms?: number;
   authSnapshotAtMs?: number;
+  auth_type?: string;
+  authType?: string;
+  client_ip?: string;
+  clientIp?: string;
+  x_forwarded_for?: string;
+  xForwardedFor?: string;
+  user_agent?: string;
+  userAgent?: string;
   reasoning_effort?: string;
   reasoningEffort?: string;
   service_tier?: string;
   serviceTier?: string;
+  request_service_tier?: string;
+  requestServiceTier?: string;
+  response_service_tier?: string;
+  responseServiceTier?: string;
+  cache_input_mode?: CacheInputMode | string;
+  cacheInputMode?: CacheInputMode | string;
   executor_type?: string;
   executorType?: string;
+  provider?: string;
+  analytics_model?: string;
+  analyticsModel?: string;
+  requested_model?: string;
+  requestedModel?: string;
+  resolved_model?: string;
+  resolvedModel?: string;
   latency_ms?: number;
   ttft_ms?: number;
   tokens: UsageTokens;
@@ -159,6 +244,7 @@ export interface UsageDetail {
   fail_body?: string;
   failBody?: string;
   __modelName?: string;
+  __requestedModel?: string;
   __resolvedModel?: string;
   __timestampMs?: number;
 }
@@ -261,6 +347,18 @@ const isModelFamily = (modelName: string, family: string): boolean => {
 
 const isGpt56Model = (modelName: string): boolean => isModelFamily(modelName, 'gpt-5.6');
 
+const supportsLongContextPremium = (modelName: string): boolean => {
+  const slug = normalizedModelSlug(modelName);
+  if (isGpt56Model(slug)) return true;
+  if (slug === 'gpt-5.5' || slug.startsWith('gpt-5.5-20')) return true;
+  return (
+    slug === 'gpt-5.4' ||
+    slug.startsWith('gpt-5.4-20') ||
+    slug === 'gpt-5.4-pro' ||
+    slug.startsWith('gpt-5.4-pro-20')
+  );
+};
+
 const isConfiguredPriceValue = (value: unknown, configured?: boolean): boolean => {
   const parsed = Number(value);
   return configured === true || (Number.isFinite(parsed) && parsed > 0);
@@ -313,6 +411,7 @@ export function getServiceTierMultiplier(modelName: string, serviceTier?: string
   const tier = String(serviceTier ?? '')
     .trim()
     .toLowerCase();
+  if (tier === 'flex' || tier === 'batch') return 0.5;
   if (tier !== 'priority' && tier !== 'fast') return 1;
 
   const normalizedModel = String(modelName ?? '')
@@ -343,6 +442,188 @@ export const compatibleCachedTokens = (
   const fineGrained =
     Math.max(toFiniteNumber(cacheReadTokens), 0) + Math.max(toFiniteNumber(cacheCreationTokens), 0);
   return Math.max(cached - fineGrained, 0);
+};
+
+export interface CacheInputContext {
+  explicitMode?: unknown;
+  executorType?: unknown;
+  provider?: unknown;
+  providerSnapshot?: unknown;
+  resolvedModel?: unknown;
+  requestedModel?: unknown;
+  displayModel?: unknown;
+}
+
+const normalizeCacheIdentity = (value: unknown): string =>
+  String(value ?? '')
+    .trim()
+    .toLowerCase();
+
+const classifyExecutorCacheInputMode = (value: unknown): CacheInputMode | undefined => {
+  const executor = normalizeCacheIdentity(value);
+  if (!executor) return undefined;
+  if (executor.includes('claude')) return 'separate_from_input';
+  if (
+    [
+      'openaicompat',
+      'openai_compat',
+      'openai-compat',
+      'openai',
+      'codex',
+      'gemini',
+      'aistudio',
+      'ai_studio',
+      'ai-studio',
+      'antigravity',
+      'xai',
+      'kimi',
+    ].some((marker) => executor.includes(marker))
+  ) {
+    return 'included_in_input';
+  }
+  return undefined;
+};
+
+const classifyProviderCacheInputMode = (value: unknown): CacheInputMode | undefined => {
+  const provider = normalizeCacheIdentity(value);
+  if (!provider) return undefined;
+  if (provider.includes('anthropic') || provider.includes('claude')) {
+    return 'separate_from_input';
+  }
+  if (
+    [
+      'openai',
+      'codex',
+      'gemini',
+      'vertex',
+      'aistudio',
+      'ai_studio',
+      'ai-studio',
+      'interaction',
+      'antigravity',
+      'xai',
+      'kimi',
+      'moonshot',
+    ].some((marker) => provider.includes(marker))
+  ) {
+    return 'included_in_input';
+  }
+  return undefined;
+};
+
+const classifyModelCacheInputMode = (value: unknown): CacheInputMode | undefined => {
+  const model = normalizeCacheIdentity(value);
+  if (!model) return undefined;
+  if (model.includes('anthropic') || model.includes('claude')) {
+    return 'separate_from_input';
+  }
+  if (
+    [
+      'gpt-',
+      'openai',
+      'codex',
+      'gemini',
+      'vertex',
+      'aistudio',
+      'antigravity',
+      'grok',
+      'xai',
+      'kimi',
+      'moonshot',
+    ].some((marker) => model.includes(marker))
+  ) {
+    return 'included_in_input';
+  }
+  return undefined;
+};
+
+export const inferCacheInputMode = (
+  context: CacheInputContext,
+  cacheReadTokens: number,
+  cacheCreationTokens: number
+): CacheInputMode => {
+  const normalizedMode = normalizeCacheIdentity(context.explicitMode);
+  if (normalizedMode === 'separate_from_input') return 'separate_from_input';
+  if (normalizedMode === 'included_in_input') return 'included_in_input';
+  const executorMode = classifyExecutorCacheInputMode(context.executorType);
+  if (executorMode) return executorMode;
+  for (const provider of [context.provider, context.providerSnapshot]) {
+    const providerMode = classifyProviderCacheInputMode(provider);
+    if (providerMode) return providerMode;
+  }
+  for (const model of [context.resolvedModel, context.requestedModel, context.displayModel]) {
+    const modelMode = classifyModelCacheInputMode(model);
+    if (modelMode) return modelMode;
+  }
+  return cacheReadTokens > 0 || cacheCreationTokens > 0
+    ? 'separate_from_input'
+    : 'included_in_input';
+};
+
+export const normalizeCacheAccounting = (input: {
+  context: CacheInputContext;
+  inputTokens: unknown;
+  cachedTokens: unknown;
+  cacheTokens: unknown;
+  cacheReadTokens: unknown;
+  cacheCreationTokens: unknown;
+}) => {
+  const rawInput = Math.max(toFiniteNumber(input.inputTokens), 0);
+  const rawRead = Math.max(toFiniteNumber(input.cacheReadTokens), 0);
+  const creation = Math.max(toFiniteNumber(input.cacheCreationTokens), 0);
+  const legacyRead = compatibleCachedTokens(
+    input.cachedTokens,
+    input.cacheTokens,
+    rawRead,
+    creation
+  );
+  const read = legacyRead + rawRead;
+  const mode = inferCacheInputMode(input.context, rawRead, creation);
+  return {
+    mode,
+    legacyRead,
+    cacheReadTokens: rawRead,
+    cacheCreationTokens: creation,
+    totalInputTokens: mode === 'separate_from_input' ? rawInput + read + creation : rawInput,
+    uncachedInputTokens:
+      mode === 'separate_from_input' ? rawInput : Math.max(rawInput - read - creation, 0),
+  };
+};
+
+export type CacheHitMetricsInput = {
+  modelName?: string;
+  inputTokens: unknown;
+  cachedTokens: unknown;
+  cacheReadTokens: unknown;
+  cacheCreationTokens: unknown;
+};
+
+export const getCacheHitTotals = ({
+  inputTokens,
+  cachedTokens,
+  cacheReadTokens,
+}: CacheHitMetricsInput): { hitTokens: number; inputTokens: number } => {
+  const input = Math.max(toFiniteNumber(inputTokens), 0);
+  const cached = Math.max(toFiniteNumber(cachedTokens), 0);
+  const cacheRead = Math.max(toFiniteNumber(cacheReadTokens), 0);
+  return {
+    hitTokens: cached + cacheRead,
+    inputTokens: input,
+  };
+};
+
+export const calculateCacheHitRate = (input: CacheHitMetricsInput): number => {
+  const totals = getCacheHitTotals(input);
+  return calculateCacheHitRateFromTotals(totals.hitTokens, totals.inputTokens);
+};
+
+export const calculateCacheHitRateFromTotals = (
+  hitTokens: unknown,
+  inputTokens: unknown
+): number => {
+  const normalizedInput = Math.max(toFiniteNumber(inputTokens), 0);
+  if (normalizedInput <= 0) return 0;
+  return Math.min(1, Math.max(toFiniteNumber(hitTokens), 0) / normalizedInput);
 };
 
 const getApisRecord = (usageData: unknown): Record<string, unknown> | null => {
@@ -498,35 +779,42 @@ export function extractTTFTMs(detail: unknown): number | null {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
-const readTokens = (detail: Record<string, unknown>): UsageTokens => {
+const readTokens = (detail: Record<string, unknown>, modelName: string): UsageTokens => {
   const tokensRaw = isRecord(detail.tokens) ? detail.tokens : {};
   const cacheReadTokens = readFirstTokenNumber(tokensRaw, CACHE_READ_TOKEN_KEYS);
   const cacheCreationTokens = readFirstTokenNumber(tokensRaw, CACHE_CREATION_TOKEN_KEYS);
-  const cachedTokens = compatibleCachedTokens(
-    tokensRaw.cached_tokens ?? tokensRaw.cachedTokens,
-    tokensRaw.cache_tokens ?? tokensRaw.cacheTokens,
+  const accounting = normalizeCacheAccounting({
+    context: {
+      explicitMode:
+        tokensRaw.cache_input_mode ??
+        tokensRaw.cacheInputMode ??
+        detail.cache_input_mode ??
+        detail.cacheInputMode,
+      executorType: detail.executor_type ?? detail.executorType,
+      provider: detail.provider,
+      providerSnapshot: detail.auth_provider_snapshot ?? detail.authProviderSnapshot,
+      resolvedModel: detail.resolved_model ?? detail.resolvedModel,
+      requestedModel: detail.requested_model ?? detail.requestedModel ?? detail.alias,
+      displayModel: modelName,
+    },
+    inputTokens: tokensRaw.input_tokens ?? tokensRaw.inputTokens,
+    cachedTokens: tokensRaw.cached_tokens ?? tokensRaw.cachedTokens,
+    cacheTokens: tokensRaw.cache_tokens ?? tokensRaw.cacheTokens,
     cacheReadTokens,
-    cacheCreationTokens
-  );
-  const inputTokens = toFiniteNumber(tokensRaw.input_tokens ?? tokensRaw.inputTokens);
+    cacheCreationTokens,
+  });
+  const inputTokens = accounting.totalInputTokens;
   const outputTokens = toFiniteNumber(tokensRaw.output_tokens ?? tokensRaw.outputTokens);
   const reasoningTokens = toFiniteNumber(tokensRaw.reasoning_tokens ?? tokensRaw.reasoningTokens);
   const explicitTotalTokens = toFiniteNumber(tokensRaw.total_tokens ?? tokensRaw.totalTokens);
   const totalTokens =
-    explicitTotalTokens > 0
-      ? explicitTotalTokens
-      : inputTokens +
-        outputTokens +
-        reasoningTokens +
-        cachedTokens +
-        cacheReadTokens +
-        cacheCreationTokens;
+    explicitTotalTokens > 0 ? explicitTotalTokens : inputTokens + outputTokens + reasoningTokens;
   return {
     input_tokens: inputTokens,
     output_tokens: outputTokens,
     reasoning_tokens: reasoningTokens,
-    cached_tokens: cachedTokens,
-    cache_tokens: cachedTokens,
+    cached_tokens: accounting.legacyRead,
+    cache_tokens: accounting.legacyRead,
     cache_read_tokens: cacheReadTokens,
     cache_creation_tokens: cacheCreationTokens,
     total_tokens: totalTokens,
@@ -576,6 +864,11 @@ export function collectUsageDetails(usageData: unknown): UsageDetail[] {
         const latencyMs = extractLatencyMs(detailRaw);
         const ttftMs = extractTTFTMs(detailRaw);
         const failRaw = isRecord(detailRaw.fail) ? detailRaw.fail : {};
+        const requestedModel =
+          readDetailString(
+            detailRaw.requested_model ?? detailRaw.requestedModel ?? detailRaw.alias
+          ) || modelName;
+        const analyticsModel = normalizeAnalyticsModel(requestedModel);
         details.push({
           timestamp,
           source: normalizeSourceWithCache(sourceCache, detailRaw.source),
@@ -602,14 +895,30 @@ export function collectUsageDetails(usageData: unknown): UsageDetail[] {
           auth_snapshot_at_ms: toPositiveNumber(
             detailRaw.auth_snapshot_at_ms ?? detailRaw.authSnapshotAtMs
           ),
+          auth_type: readDetailString(detailRaw.auth_type ?? detailRaw.authType),
           reasoning_effort: readDetailString(
             detailRaw.reasoning_effort ?? detailRaw.reasoningEffort
           ),
           service_tier: readDetailString(detailRaw.service_tier ?? detailRaw.serviceTier),
           executor_type: readDetailString(detailRaw.executor_type ?? detailRaw.executorType),
+          provider: readDetailString(
+            detailRaw.provider ?? detailRaw.type ?? detailRaw.auth_type ?? detailRaw.authType
+          ),
+          analytics_model: analyticsModel,
+          requested_model: requestedModel,
+          resolved_model: readDetailString(detailRaw.resolved_model ?? detailRaw.resolvedModel),
           latency_ms: latencyMs ?? undefined,
           ttft_ms: ttftMs ?? undefined,
-          tokens: readTokens(detailRaw),
+          request_service_tier: readDetailString(
+            detailRaw.request_service_tier ?? detailRaw.requestServiceTier
+          ),
+          response_service_tier: readDetailString(
+            detailRaw.response_service_tier ?? detailRaw.responseServiceTier
+          ),
+          cache_input_mode: readDetailString(
+            detailRaw.cache_input_mode ?? detailRaw.cacheInputMode
+          ),
+          tokens: readTokens(detailRaw, modelName),
           failed: detailRaw.failed === true,
           fail_status_code:
             toOptionalNumber(
@@ -641,7 +950,8 @@ export function collectUsageDetails(usageData: unknown): UsageDetail[] {
           ),
           header_trace_id: readDetailString(detailRaw.header_trace_id ?? detailRaw.headerTraceId),
           fail_body: readDetailString(detailRaw.fail_body ?? detailRaw.failBody ?? failRaw.body),
-          __modelName: modelName,
+          __modelName: analyticsModel,
+          __requestedModel: requestedModel,
           __resolvedModel: readDetailString(detailRaw.resolved_model ?? detailRaw.resolvedModel),
           __timestampMs: Number.isNaN(timestampMs) ? 0 : timestampMs,
         });
@@ -686,6 +996,11 @@ export function collectUsageDetailsWithEndpoint(usageData: unknown): UsageDetail
         const latencyMs = extractLatencyMs(detailRaw);
         const ttftMs = extractTTFTMs(detailRaw);
         const failRaw = isRecord(detailRaw.fail) ? detailRaw.fail : {};
+        const requestedModel =
+          readDetailString(
+            detailRaw.requested_model ?? detailRaw.requestedModel ?? detailRaw.alias
+          ) || modelName;
+        const analyticsModel = normalizeAnalyticsModel(requestedModel);
         details.push({
           timestamp,
           source: normalizeSourceWithCache(sourceCache, detailRaw.source),
@@ -712,14 +1027,30 @@ export function collectUsageDetailsWithEndpoint(usageData: unknown): UsageDetail
           auth_snapshot_at_ms: toPositiveNumber(
             detailRaw.auth_snapshot_at_ms ?? detailRaw.authSnapshotAtMs
           ),
+          auth_type: readDetailString(detailRaw.auth_type ?? detailRaw.authType),
           reasoning_effort: readDetailString(
             detailRaw.reasoning_effort ?? detailRaw.reasoningEffort
           ),
           service_tier: readDetailString(detailRaw.service_tier ?? detailRaw.serviceTier),
           executor_type: readDetailString(detailRaw.executor_type ?? detailRaw.executorType),
+          provider: readDetailString(
+            detailRaw.provider ?? detailRaw.type ?? detailRaw.auth_type ?? detailRaw.authType
+          ),
+          analytics_model: analyticsModel,
+          requested_model: requestedModel,
+          resolved_model: readDetailString(detailRaw.resolved_model ?? detailRaw.resolvedModel),
+          request_service_tier: readDetailString(
+            detailRaw.request_service_tier ?? detailRaw.requestServiceTier
+          ),
+          response_service_tier: readDetailString(
+            detailRaw.response_service_tier ?? detailRaw.responseServiceTier
+          ),
+          cache_input_mode: readDetailString(
+            detailRaw.cache_input_mode ?? detailRaw.cacheInputMode
+          ),
           latency_ms: latencyMs ?? undefined,
           ttft_ms: ttftMs ?? undefined,
-          tokens: readTokens(detailRaw),
+          tokens: readTokens(detailRaw, modelName),
           failed: detailRaw.failed === true,
           fail_status_code:
             toOptionalNumber(
@@ -751,7 +1082,8 @@ export function collectUsageDetailsWithEndpoint(usageData: unknown): UsageDetail
           ),
           header_trace_id: readDetailString(detailRaw.header_trace_id ?? detailRaw.headerTraceId),
           fail_body: readDetailString(detailRaw.fail_body ?? detailRaw.failBody ?? failRaw.body),
-          __modelName: modelName,
+          __modelName: analyticsModel,
+          __requestedModel: requestedModel,
           __resolvedModel: readDetailString(detailRaw.resolved_model ?? detailRaw.resolvedModel),
           __endpoint: endpoint,
           __endpointMethod: endpointMethod,
@@ -797,26 +1129,43 @@ export function extractTotalTokens(detail: unknown): number {
 export function calculateCost(
   detail: Pick<
     UsageDetail,
-    'tokens' | '__modelName' | '__resolvedModel' | 'service_tier' | 'serviceTier'
+    | 'tokens'
+    | '__modelName'
+    | '__requestedModel'
+    | '__resolvedModel'
+    | 'service_tier'
+    | 'serviceTier'
+    | 'request_service_tier'
+    | 'requestServiceTier'
+    | 'response_service_tier'
+    | 'responseServiceTier'
+    | 'executor_type'
+    | 'executorType'
+    | 'provider'
+    | 'auth_provider_snapshot'
+    | 'authProviderSnapshot'
+    | 'auth_type'
+    | 'authType'
   >,
   modelPrices: Record<string, ModelPrice>
 ): number {
   const resolvedModel = detail.__resolvedModel || '';
-  const requestedModel = detail.__modelName || '';
+  const analyticsModel = detail.__modelName || '';
+  const requestedModel = detail.__requestedModel || analyticsModel;
   const resolvedPrice = resolvedModel ? modelPrices[resolvedModel] : undefined;
+  const analyticsPrice = analyticsModel ? modelPrices[analyticsModel] : undefined;
   const requestedPrice = requestedModel ? modelPrices[requestedModel] : undefined;
-  const behaviorModel = resolvedModel || requestedModel;
+  const behaviorModel = resolvedModel || analyticsModel || requestedModel;
   const behaviorFallback = getOfficialGpt56Price(behaviorModel);
   const officialCandidatePrice =
-    getOfficialGpt56Price(resolvedModel) || getOfficialGpt56Price(requestedModel);
-  const configuredPrice = resolvedPrice || requestedPrice;
-  const price = configuredPrice
+    getOfficialGpt56Price(resolvedModel) ||
+    getOfficialGpt56Price(analyticsModel) ||
+    getOfficialGpt56Price(requestedModel);
+  const configuredPrice = resolvedPrice || analyticsPrice || requestedPrice;
+  const basePrice = configuredPrice
     ? {
         ...configuredPrice,
-        prompt: isConfiguredPriceValue(
-          configuredPrice.prompt,
-          configuredPrice.promptConfigured
-        )
+        prompt: isConfiguredPriceValue(configuredPrice.prompt, configuredPrice.promptConfigured)
           ? Number(configuredPrice.prompt)
           : (behaviorFallback?.prompt ?? 0),
         completion: isConfiguredPriceValue(
@@ -827,7 +1176,33 @@ export function calculateCost(
           : (behaviorFallback?.completion ?? 0),
       }
     : officialCandidatePrice;
-  if (!price) return 0;
+  if (!basePrice) return 0;
+
+  const identity = [
+    detail.executor_type,
+    detail.executorType,
+    detail.provider,
+    detail.auth_provider_snapshot,
+    detail.authProviderSnapshot,
+    detail.auth_type,
+    detail.authType,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  const serviceTier = identity.includes('codex')
+    ? detail.request_service_tier ||
+      detail.requestServiceTier ||
+      detail.service_tier ||
+      detail.serviceTier ||
+      detail.response_service_tier ||
+      detail.responseServiceTier
+    : detail.response_service_tier ||
+      detail.responseServiceTier ||
+      detail.service_tier ||
+      detail.serviceTier ||
+      detail.request_service_tier ||
+      detail.requestServiceTier;
 
   const inputTokens = Math.max(toFiniteNumber(detail.tokens.input_tokens), 0);
   const completionTokens = Math.max(toFiniteNumber(detail.tokens.output_tokens), 0);
@@ -837,57 +1212,211 @@ export function calculateCost(
   );
   const cacheReadTokens = Math.max(toFiniteNumber(detail.tokens.cache_read_tokens), 0);
   const cacheCreationTokens = Math.max(toFiniteNumber(detail.tokens.cache_creation_tokens), 0);
+  const hasContextPricing = Boolean(basePrice.contextTiers?.length);
+  const contextTier = selectContextTierPrice(basePrice, inputTokens);
+  const longContext =
+    !hasContextPricing && supportsLongContextPremium(behaviorModel) && inputTokens > 272_000;
+  const normalizedServiceTier = String(serviceTier ?? '')
+    .trim()
+    .toLowerCase();
+  const longContextOverridesServiceTier =
+    longContext && (normalizedServiceTier === 'priority' || normalizedServiceTier === 'fast');
+  const serviceTierPrice =
+    !contextTier && !longContextOverridesServiceTier
+      ? selectServiceTierPrice(basePrice, serviceTier)
+      : undefined;
+  const price = contextTier
+    ? applyContextTierPrice(basePrice, contextTier)
+    : serviceTierPrice
+      ? applyServiceTierPrice(basePrice, serviceTierPrice)
+      : basePrice;
   const promptPrice = Number(price.prompt) || 0;
   const completionPrice = Number(price.completion) || 0;
-  let standardCost = 0;
-  if (isGpt56Model(behaviorModel)) {
-    const configuredCacheReadPrice = Number(price.cacheRead) || 0;
-    const cacheReadPrice = isConfiguredPriceValue(
-      configuredCacheReadPrice,
-      price.cacheReadConfigured
-    )
-      ? configuredCacheReadPrice
-      : promptPrice * 0.1;
-    const configuredCacheCreationPrice = Number(price.cacheCreation) || 0;
-    const cacheCreationPrice = isConfiguredPriceValue(
-      configuredCacheCreationPrice,
-      price.cacheCreationConfigured
-    )
-      ? configuredCacheCreationPrice
-      : promptPrice * 1.25;
-    const readTokens = cachedTokens + cacheReadTokens;
-    const promptTokens = Math.max(inputTokens - readTokens - cacheCreationTokens, 0);
-    const longContext = inputTokens > 272_000;
-    const inputMultiplier = longContext ? 2 : 1;
-    const outputMultiplier = longContext ? 1.5 : 1;
-    standardCost =
-      ((promptTokens / TOKENS_PER_PRICE_UNIT) * promptPrice +
-        (readTokens / TOKENS_PER_PRICE_UNIT) * cacheReadPrice +
-        (cacheCreationTokens / TOKENS_PER_PRICE_UNIT) * cacheCreationPrice) *
-        inputMultiplier +
-      (completionTokens / TOKENS_PER_PRICE_UNIT) * completionPrice * outputMultiplier;
-  } else if (cacheReadTokens > 0 || cacheCreationTokens > 0) {
-    const cacheReadPrice = Number(price.cacheRead) || Number(price.cache) || 0;
-    const cacheCreationPrice = Number(price.cacheCreation) || promptPrice;
-    const promptTokens = Math.max(inputTokens - cachedTokens, 0);
-    standardCost =
-      (promptTokens / TOKENS_PER_PRICE_UNIT) * promptPrice +
-      (completionTokens / TOKENS_PER_PRICE_UNIT) * completionPrice +
+  const configuredCacheReadPrice = Number(price.cacheRead) || 0;
+  const cacheReadPrice = isConfiguredPriceValue(configuredCacheReadPrice, price.cacheReadConfigured)
+    ? configuredCacheReadPrice
+    : isGpt56Model(behaviorModel)
+      ? promptPrice * 0.1
+      : Number(price.cache) || 0;
+  const configuredCacheCreationPrice = Number(price.cacheCreation) || 0;
+  const cacheCreationPrice = isConfiguredPriceValue(
+    configuredCacheCreationPrice,
+    price.cacheCreationConfigured
+  )
+    ? configuredCacheCreationPrice
+    : promptPrice * (isGpt56Model(behaviorModel) ? 1.25 : 1);
+  const readTokens = cachedTokens + cacheReadTokens;
+  const promptTokens = Math.max(inputTokens - readTokens - cacheCreationTokens, 0);
+  const inputMultiplier = longContext ? 2 : 1;
+  const outputMultiplier = longContext ? 1.5 : 1;
+  const standardCost =
+    ((promptTokens / TOKENS_PER_PRICE_UNIT) * promptPrice +
       (cachedTokens / TOKENS_PER_PRICE_UNIT) * (Number(price.cache) || 0) +
       (cacheReadTokens / TOKENS_PER_PRICE_UNIT) * cacheReadPrice +
-      (cacheCreationTokens / TOKENS_PER_PRICE_UNIT) * cacheCreationPrice;
-  } else {
-    const promptTokens = Math.max(inputTokens - cachedTokens, 0);
-    const promptCost = (promptTokens / TOKENS_PER_PRICE_UNIT) * promptPrice;
-    const completionCost = (completionTokens / TOKENS_PER_PRICE_UNIT) * completionPrice;
-    const cachedCost = (cachedTokens / TOKENS_PER_PRICE_UNIT) * (Number(price.cache) || 0);
-    standardCost = promptCost + cachedCost + completionCost;
-  }
+      (cacheCreationTokens / TOKENS_PER_PRICE_UNIT) * cacheCreationPrice) *
+      inputMultiplier +
+    (completionTokens / TOKENS_PER_PRICE_UNIT) * completionPrice * outputMultiplier;
 
-  const serviceTier = detail.service_tier ?? detail.serviceTier;
-  const multiplier = getServiceTierMultiplier(behaviorModel, serviceTier);
+  const multiplier =
+    longContextOverridesServiceTier || contextTier || serviceTierPrice
+      ? 1
+      : getServiceTierMultiplier(behaviorModel, serviceTier);
   const total = standardCost * multiplier;
   return Number.isFinite(total) && total > 0 ? total : 0;
+}
+
+function selectContextTierPrice(
+  price: ModelPrice,
+  inputTokens: number
+): ModelPriceContextTier | undefined {
+  return (price.contextTiers ?? []).reduce<ModelPriceContextTier | undefined>(
+    (selected, candidate) =>
+      inputTokens > candidate.thresholdTokens &&
+      (!selected || candidate.thresholdTokens > selected.thresholdTokens)
+        ? candidate
+        : selected,
+    undefined
+  );
+}
+
+function applyContextTierPrice(price: ModelPrice, tier: ModelPriceContextTier): ModelPrice {
+  return {
+    ...price,
+    prompt: tier.promptConfigured ? tier.prompt : price.prompt,
+    completion: tier.completionConfigured ? tier.completion : price.completion,
+    cache: tier.cacheConfigured ? tier.cache : price.cache,
+    cacheRead: tier.cacheReadConfigured ? tier.cacheRead : price.cacheRead,
+    cacheCreation: tier.cacheCreationConfigured ? tier.cacheCreation : price.cacheCreation,
+    promptConfigured: tier.promptConfigured ? true : price.promptConfigured,
+    completionConfigured: tier.completionConfigured ? true : price.completionConfigured,
+    cacheReadConfigured: tier.cacheReadConfigured ? true : price.cacheReadConfigured,
+    cacheCreationConfigured: tier.cacheCreationConfigured ? true : price.cacheCreationConfigured,
+  };
+}
+
+function selectServiceTierPrice(
+  price: ModelPrice,
+  serviceTier: string | undefined
+): ModelPriceServiceTier | undefined {
+  const normalized = String(serviceTier ?? '')
+    .trim()
+    .toLowerCase();
+  if (!normalized) return undefined;
+  return (price.serviceTiers ?? []).find(
+    (tier) => normalized === tier.mode || normalized === tier.serviceTier
+  );
+}
+
+function applyServiceTierPrice(price: ModelPrice, tier: ModelPriceServiceTier): ModelPrice {
+  return {
+    ...price,
+    prompt: tier.promptConfigured ? tier.prompt : price.prompt,
+    completion: tier.completionConfigured ? tier.completion : price.completion,
+    cache: tier.cacheConfigured ? tier.cache : price.cache,
+    cacheRead: tier.cacheReadConfigured ? tier.cacheRead : price.cacheRead,
+    cacheCreation: tier.cacheCreationConfigured ? tier.cacheCreation : price.cacheCreation,
+    promptConfigured: tier.promptConfigured ? true : price.promptConfigured,
+    completionConfigured: tier.completionConfigured ? true : price.completionConfigured,
+    cacheReadConfigured: tier.cacheReadConfigured ? true : price.cacheReadConfigured,
+    cacheCreationConfigured: tier.cacheCreationConfigured ? true : price.cacheCreationConfigured,
+  };
+}
+
+function normalizeContextTiers(value: unknown): ModelPriceContextTier[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const tiers: ModelPriceContextTier[] = [];
+  const thresholds = new Set<number>();
+  for (const item of value) {
+    if (!isRecord(item)) return undefined;
+    const thresholdTokens = Number(item.thresholdTokens);
+    if (
+      !Number.isSafeInteger(thresholdTokens) ||
+      thresholdTokens <= 0 ||
+      thresholds.has(thresholdTokens)
+    ) {
+      return undefined;
+    }
+    const prompt = toFiniteNumber(item.prompt);
+    const completion = toFiniteNumber(item.completion);
+    const cache = toFiniteNumber(item.cache);
+    const cacheRead = toFiniteNumber(item.cacheRead);
+    const cacheCreation = toFiniteNumber(item.cacheCreation);
+    if ([prompt, completion, cache, cacheRead, cacheCreation].some((rate) => rate < 0)) {
+      return undefined;
+    }
+    thresholds.add(thresholdTokens);
+    tiers.push({
+      thresholdTokens,
+      prompt,
+      completion,
+      cache,
+      cacheRead,
+      cacheCreation,
+      promptConfigured: item.promptConfigured === true,
+      completionConfigured: item.completionConfigured === true,
+      cacheConfigured: item.cacheConfigured === true,
+      cacheReadConfigured: item.cacheReadConfigured === true,
+      cacheCreationConfigured: item.cacheCreationConfigured === true,
+    });
+  }
+  return tiers.sort((left, right) => left.thresholdTokens - right.thresholdTokens);
+}
+
+function normalizeServiceTiers(value: unknown): ModelPriceServiceTier[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const tiers: ModelPriceServiceTier[] = [];
+  const identifiers = new Set<string>();
+  for (const item of value) {
+    if (!isRecord(item)) return undefined;
+    const mode = typeof item.mode === 'string' ? item.mode.trim().toLowerCase() : '';
+    const serviceTier =
+      typeof item.serviceTier === 'string' ? item.serviceTier.trim().toLowerCase() : '';
+    if (!mode || !serviceTier || identifiers.has(mode) || identifiers.has(serviceTier)) {
+      return undefined;
+    }
+    const prompt = toFiniteNumber(item.prompt);
+    const completion = toFiniteNumber(item.completion);
+    const cache = toFiniteNumber(item.cache);
+    const cacheRead = toFiniteNumber(item.cacheRead);
+    const cacheCreation = toFiniteNumber(item.cacheCreation);
+    if ([prompt, completion, cache, cacheRead, cacheCreation].some((rate) => rate < 0)) {
+      return undefined;
+    }
+    const promptConfigured = item.promptConfigured === true;
+    const completionConfigured = item.completionConfigured === true;
+    const cacheConfigured = item.cacheConfigured === true;
+    const cacheReadConfigured = item.cacheReadConfigured === true;
+    const cacheCreationConfigured = item.cacheCreationConfigured === true;
+    if (
+      !promptConfigured &&
+      !completionConfigured &&
+      !cacheConfigured &&
+      !cacheReadConfigured &&
+      !cacheCreationConfigured
+    ) {
+      return undefined;
+    }
+    identifiers.add(mode);
+    identifiers.add(serviceTier);
+    tiers.push({
+      mode,
+      serviceTier,
+      prompt,
+      completion,
+      cache,
+      cacheRead,
+      cacheCreation,
+      promptConfigured,
+      completionConfigured,
+      cacheConfigured,
+      cacheReadConfigured,
+      cacheCreationConfigured,
+    });
+  }
+  return tiers.sort(
+    (left, right) =>
+      left.mode.localeCompare(right.mode) || left.serviceTier.localeCompare(right.serviceTier)
+  );
 }
 
 export function loadModelPrices(): Record<string, ModelPrice> {
@@ -920,9 +1449,15 @@ export function loadModelPrices(): Record<string, ModelPrice> {
         cache,
         cacheRead,
         cacheCreation,
+        promptConfigured: price.promptConfigured === true,
+        completionConfigured: price.completionConfigured === true,
+        cacheReadConfigured: price.cacheReadConfigured === true,
+        cacheCreationConfigured: price.cacheCreationConfigured === true,
         source: readDetailString(price.source),
         sourceModelId: readDetailString(price.sourceModelId),
         rawJson: readDetailString(price.rawJson),
+        contextTiers: normalizeContextTiers(price.contextTiers),
+        serviceTiers: normalizeServiceTiers(price.serviceTiers),
         updatedAtMs: toPositiveNumber(price.updatedAtMs),
         syncedAtMs: toPositiveNumber(price.syncedAtMs),
       };
@@ -979,14 +1514,15 @@ export function formatCompactNumber(value: number): string {
   return abs >= 1 ? num.toFixed(0) : num.toFixed(2);
 }
 
-export function formatUsd(value: number): string {
+export function formatUsd(value: number, fractionDigits = 2): string {
   const num = Number(value);
-  if (!Number.isFinite(num)) return '$0.00';
+  const digits = Number.isInteger(fractionDigits) ? Math.max(0, Math.min(6, fractionDigits)) : 2;
+  if (!Number.isFinite(num)) return `$${(0).toFixed(digits)}`;
 
-  const fixed = num.toFixed(2);
+  const fixed = num.toFixed(digits);
   const parts = Number(fixed).toLocaleString(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
   });
   return `$${parts}`;
 }

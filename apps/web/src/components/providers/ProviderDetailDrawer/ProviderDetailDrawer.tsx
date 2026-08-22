@@ -2,6 +2,7 @@ import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/Button';
 import { Drawer } from '@/components/ui/Drawer';
 import { ToggleSwitch } from '@/components/ui/ToggleSwitch';
+import { CoolingPolicySelect } from '../CoolingPolicySelect';
 import { IconCheck, IconX } from '@/components/ui/icons';
 import { maskApiKey } from '@/utils/format';
 import { ProviderStatusBar } from '../ProviderStatusBar';
@@ -12,6 +13,7 @@ import {
   type ProviderRecentUsageMap,
 } from '../utils';
 import { getProviderKindIcon, PROVIDER_KIND_LABELS } from '../ProviderTable/kindMeta';
+import { coolingPolicyFromOverride, type CoolingPolicy } from '@/types';
 import type { ProviderRow } from '../ProviderTable/rowData';
 import styles from './ProviderDetailDrawer.module.scss';
 
@@ -28,7 +30,7 @@ interface ProviderDetailDrawerProps {
   onToggle: (row: ProviderRow, enabled: boolean) => void;
   onToggleWebsockets: (row: ProviderRow, enabled: boolean) => void;
   onToggleCloak: (row: ProviderRow, enabled: boolean) => void;
-  onToggleDisableCooling: (row: ProviderRow, enabled: boolean) => void;
+  onToggleDisableCooling: (row: ProviderRow, policy: CoolingPolicy) => void;
 }
 
 interface FieldRowProps {
@@ -62,15 +64,19 @@ export function ProviderDetailDrawer({
   onToggleDisableCooling,
 }: ProviderDetailDrawerProps) {
   const { t } = useTranslation();
+  const formatCredentialWeight = (weight: number | undefined) =>
+    weight === undefined ? `1 (${t('ai_providers.weight_default_label')})` : String(weight);
 
   const renderQuickSwitches = () => {
     if (!row) return null;
-    const supportsProviderKeySwitches = row.kind === 'codex' || row.kind === 'claude';
+    const supportsProviderKeySwitches =
+      row.kind === 'codex' || row.kind === 'xai' || row.kind === 'claude';
     const showWebsockets =
-      supportsProviderKeySwitches && (row.kind === 'codex' || row.raw.websockets !== undefined);
+      supportsProviderKeySwitches &&
+      (row.kind === 'codex' || row.kind === 'xai' || row.raw.websockets !== undefined);
     const showCloak =
       supportsProviderKeySwitches && (row.kind === 'claude' || row.raw.cloak !== undefined);
-    const showDisableCooling = row.kind !== 'vertex';
+    const showDisableCooling = true;
     if (!showWebsockets && !showCloak && !showDisableCooling) return null;
 
     return (
@@ -117,17 +123,19 @@ export function ProviderDetailDrawer({
             <div className={styles.quickSwitchRow}>
               <div className={styles.quickSwitchText}>
                 <span className={styles.quickSwitchLabel}>
-                  {t('ai_providers.disable_cooling_label')}
+                  {t('ai_providers.cooling_policy_label')}
                 </span>
                 <span className={styles.quickSwitchHint}>
-                  {t('ai_providers.disable_cooling_hint')}
+                  {t('ai_providers.cooling_policy_hint')}
                 </span>
               </div>
-              <ToggleSwitch
-                checked={Boolean(row.raw.disableCooling)}
+              <CoolingPolicySelect
+                value={coolingPolicyFromOverride(row.raw.disableCooling)}
                 disabled={toggleDisabled}
                 onChange={(value) => onToggleDisableCooling(row, value)}
-                ariaLabel={t('ai_providers.disable_cooling_label')}
+                id="provider-detail-cooling-policy"
+                compact
+                legacyProviderSupported={row.kind !== 'vertex'}
               />
             </div>
           )}
@@ -137,12 +145,7 @@ export function ProviderDetailDrawer({
   };
 
   const renderCloak = () => {
-    if (
-      !row ||
-      row.kind === 'gemini' ||
-      row.kind === 'interactions' ||
-      row.kind === 'openai'
-    )
+    if (!row || row.kind === 'gemini' || row.kind === 'interactions' || row.kind === 'openai')
       return null;
     const cloak = row.raw.cloak;
     if (!cloak) return null;
@@ -191,6 +194,9 @@ export function ProviderDetailDrawer({
               <div key={getOpenAIEntryKey(entry, entryIndex)} className={styles.keyEntryCard}>
                 <span className={styles.keyEntryIndex}>{entryIndex + 1}</span>
                 <span className={styles.keyEntryKey}>{maskApiKey(entry.apiKey)}</span>
+                <span className={styles.keyEntryWeight}>
+                  {t('ai_providers.weight_label')}: {formatCredentialWeight(entry.weight)}
+                </span>
                 {entry.proxyUrl && <span className={styles.keyEntryProxy}>{entry.proxyUrl}</span>}
                 <span className={styles.keyEntryStats}>
                   <span className={styles.statSuccess}>
@@ -220,15 +226,19 @@ export function ProviderDetailDrawer({
       <>
         <section className={styles.section}>
           {!row.enabled && (
-            <div className={styles.disabledBadge}>
-              {t('ai_providers.config_disabled_badge')}
-            </div>
+            <div className={styles.disabledBadge}>{t('ai_providers.config_disabled_badge')}</div>
           )}
           {row.kind !== 'openai' && (
             <FieldRow label={t('common.api_key')} value={maskApiKey(row.raw.apiKey)} />
           )}
           <FieldRow label={t('common.base_url')} value={row.baseUrl} />
           <FieldRow label={t('common.priority')} value={row.priority} />
+          {row.kind !== 'openai' && (
+            <FieldRow
+              label={t('ai_providers.weight_label')}
+              value={formatCredentialWeight(row.raw.weight)}
+            />
+          )}
           <FieldRow label={t('common.prefix')} value={row.raw.prefix} />
           {row.kind !== 'openai' && (
             <FieldRow label={t('common.proxy_url')} value={row.raw.proxyUrl} />

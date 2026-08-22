@@ -4,6 +4,7 @@ import { buildSourceInfoMap } from '@/utils/sourceResolver';
 import type { UsageRankRow } from './usageAnalyticsModel';
 import {
   analyzeUsageBucket,
+  buildApiKeyTrendSeries,
   buildApiKeyRows,
   buildCredentialRows,
   buildSelectedApiKeyTrendSeries,
@@ -25,10 +26,12 @@ import {
   buildUsageHeatmapRangeContext,
   buildUsageHeatmap,
   buildUsageCredentialTimeline,
+  buildUsageApiKeyTimeline,
   buildUsageTimeline,
   computeCacheHitRate,
   computeRowAverageCostPerCall,
   computeRowCacheHitRate,
+  getUsageCacheTokens,
   getUsageRangeBounds,
   maskApiKeyHash,
   resolveUsageGranularity,
@@ -97,6 +100,8 @@ describe('usage analytics request model', () => {
   it('builds the minimum analytics include for each active tab', () => {
     expect(buildUsageAnalyticsInclude('overview', 'day')).toEqual({
       summary: true,
+      summary_profile: 'compact',
+      summary_percentiles: true,
       summary_comparison: true,
       timeline: true,
       model_stats: true,
@@ -113,6 +118,7 @@ describe('usage analytics request model', () => {
       })
     ).toEqual({
       summary: true,
+      summary_profile: 'compact',
       summary_comparison: true,
       timeline: true,
       model_stats: true,
@@ -123,6 +129,7 @@ describe('usage analytics request model', () => {
     });
     expect(buildUsageAnalyticsInclude('models', 'day')).toEqual({
       summary: true,
+      summary_profile: 'compact',
       timeline: true,
       model_stats: true,
       api_key_stats: true,
@@ -130,13 +137,14 @@ describe('usage analytics request model', () => {
     });
     expect(buildUsageAnalyticsInclude('apiKeys', 'day')).toEqual({
       summary: true,
+      summary_profile: 'compact',
       api_key_stats: true,
       granularity: 'day',
     });
     expect(buildUsageAnalyticsInclude('credentials', 'day')).toEqual({
       summary: true,
+      summary_profile: 'compact',
       credential_stats: true,
-      credential_timeline: true,
       granularity: 'day',
     });
     expect(
@@ -146,6 +154,7 @@ describe('usage analytics request model', () => {
       })
     ).toEqual({
       summary: true,
+      summary_profile: 'compact',
       heatmap: true,
       granularity: 'day',
     });
@@ -392,6 +401,23 @@ describe('usage analytics adapters', () => {
     });
   });
 
+  it('combines compatible, cache-read, and cache-creation buckets for display', () => {
+    expect(
+      getUsageCacheTokens({
+        cachedTokens: 0,
+        cacheReadTokens: 80,
+        cacheCreationTokens: 20,
+      })
+    ).toBe(100);
+    expect(
+      getUsageCacheTokens({
+        cachedTokens: 5,
+        cacheReadTokens: 4,
+        cacheCreationTokens: 1,
+      })
+    ).toBe(10);
+  });
+
   it('builds selected credential trend series from backend credential timeline buckets', () => {
     const credentialTimeline = buildUsageCredentialTimeline(
       [
@@ -599,6 +625,82 @@ describe('usage analytics adapters', () => {
     expect(result[0].points.map((point) => point.value)).toEqual([3, 7]);
   });
 
+  it('builds overview API key trends from exact per-key buckets', () => {
+    const rows: UsageRankRow[] = [
+      {
+        id: 'key-a',
+        label: 'Key A',
+        apiKeyHash: 'key-a',
+        requestCount: 8,
+        successCount: 8,
+        failureCount: 0,
+        successRate: 1,
+        totalTokens: 800,
+        inputTokens: 800,
+        outputTokens: 0,
+        cachedTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        estimatedCost: 0.8,
+        averageLatencyMs: null,
+        share: 0.8,
+      },
+      {
+        id: 'key-b',
+        label: 'Key B',
+        apiKeyHash: 'key-b',
+        requestCount: 2,
+        successCount: 2,
+        failureCount: 0,
+        successRate: 1,
+        totalTokens: 200,
+        inputTokens: 200,
+        outputTokens: 0,
+        cachedTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        estimatedCost: 0.2,
+        averageLatencyMs: null,
+        share: 0.2,
+      },
+    ];
+    const timeline = buildUsageTimeline(
+      [
+        { bucket_ms: NOW_MS, label: '12:00', calls: 5, tokens: 500, success: 5, failure: 0 },
+        {
+          bucket_ms: NOW_MS + HOUR_MS,
+          label: '13:00',
+          calls: 5,
+          tokens: 500,
+          success: 5,
+          failure: 0,
+        },
+      ],
+      'hour'
+    );
+    const apiKeyTimeline = buildUsageApiKeyTimeline(
+      [
+        { api_key_hash: 'key-a', bucket_ms: NOW_MS, calls: 2, tokens: 200, success: 2, failure: 0 },
+        {
+          api_key_hash: 'key-a',
+          bucket_ms: NOW_MS + HOUR_MS,
+          calls: 6,
+          tokens: 600,
+          success: 6,
+          failure: 0,
+        },
+        { api_key_hash: 'key-b', bucket_ms: NOW_MS, calls: 3, tokens: 300, success: 3, failure: 0 },
+      ],
+      'hour'
+    );
+
+    const result = buildApiKeyTrendSeries(rows, timeline, apiKeyTimeline, 'requestCount');
+
+    expect(result).toHaveLength(2);
+    expect(result[0].points.map((point) => point.value)).toEqual([2, 6]);
+    expect(result[1].points.map((point) => point.value)).toEqual([3, 0]);
+  });
+
   it('does not render selected API key trend when the filtered timeline is missing', () => {
     const row = {
       id: 'abcdef1234567890',
@@ -685,7 +787,14 @@ describe('usage analytics adapters', () => {
 
   it('resolves API key aliases by hash across analytics views', () => {
     const displayMap = new Map([
-      ['abcdef1234567890', { label: 'Team Alpha Key', masked: 'sk-****7890' }],
+      [
+        'abcdef1234567890',
+        {
+          label: 'Team Alpha Key',
+          masked: 'sk-****7890',
+          copyValue: 'sk-team-alpha-original',
+        },
+      ],
     ]);
     const apiKeyRows = buildApiKeyRows(
       [
@@ -733,6 +842,7 @@ describe('usage analytics adapters', () => {
     expect(apiKeyRows[0]).toMatchObject({
       apiKeyHash: 'abcdef1234567890',
       label: 'Team Alpha Key',
+      apiKeyCopyValue: 'sk-team-alpha-original',
     });
     expect(
       buildUsageMatrix({
@@ -1004,13 +1114,91 @@ describe('usage analytics adapters', () => {
     });
   });
 
-  it('estimates drilldown preview cost from model cost per token', () => {
+  it('preserves normalized cache totals while merging provider model aliases', () => {
+    const usageRow = (overrides: Partial<UsageRankRow>): UsageRankRow => ({
+      id: 'row',
+      label: 'row',
+      requestCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      successRate: 0,
+      totalTokens: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      estimatedCost: 0,
+      averageLatencyMs: null,
+      share: 0,
+      ...overrides,
+    });
+    const credentialRows = [
+      usageRow({
+        id: 'credential-a',
+        label: 'a',
+        provider: 'OpenAI',
+        models: [
+          usageRow({
+            id: 'internal-fast',
+            label: 'internal-fast',
+            model: 'internal-fast',
+            inputTokens: 100,
+            cacheReadTokens: 90,
+            cacheHitTokens: 90,
+            cacheHitInputTokens: 100,
+          }),
+        ],
+      }),
+      usageRow({
+        id: 'credential-b',
+        label: 'b',
+        provider: 'OpenAI',
+        models: [
+          usageRow({
+            id: 'internal-fast',
+            label: 'internal-fast',
+            model: 'internal-fast',
+            inputTokens: 100,
+            cacheReadTokens: 50,
+            cacheCreationTokens: 50,
+            cacheHitTokens: 50,
+            cacheHitInputTokens: 200,
+          }),
+        ],
+      }),
+    ];
+
+    const rows = buildProviderRows(
+      [
+        {
+          auth_index: 'auth-a',
+          auth_provider_snapshot: 'OpenAI',
+          calls: 2,
+          success: 2,
+          failure: 0,
+          tokens: 200,
+          cost: 0,
+          average_latency_ms: null,
+        },
+      ],
+      [],
+      credentialRows
+    );
+
+    expect(rows[0].cacheRate).toBeCloseTo(140 / 300, 6);
+  });
+
+  it('uses canonical analytics models to estimate drilldown preview cost', () => {
     const rows = buildDrilldownPreview(
       [
         {
           event_hash: 'event-a',
           timestamp_ms: NOW_MS,
-          model: 'gpt-4o',
+          model: 'deepseek-v4-flash(max)',
+          analytics_model: 'deepseek-v4-flash',
+          requested_model: 'deepseek-v4-flash(max)',
+          resolved_model: 'deepseek-v4-flash-202608',
           endpoint: '/v1/chat/completions',
           method: 'POST',
           path: '/v1/chat/completions',
@@ -1037,12 +1225,37 @@ describe('usage analytics adapters', () => {
           header_quota_used_percent: 87,
           header_quota_recover_at_ms: 1780000060000,
         },
+        {
+          event_hash: 'event-b',
+          timestamp_ms: NOW_MS,
+          model: 'deepseek-v4-flash(high)',
+          requested_model: 'deepseek-v4-flash(high)',
+          endpoint: '/v1/chat/completions',
+          method: 'POST',
+          path: '/v1/chat/completions',
+          auth_index: '0',
+          source: 'codex',
+          source_hash: 'source-a',
+          api_key_hash: 'abcdef1234567890',
+          account_snapshot: 'team-alpha',
+          auth_label_snapshot: 'prod',
+          auth_provider_snapshot: 'openai',
+          input_tokens: 60,
+          output_tokens: 40,
+          cached_tokens: 0,
+          cache_read_tokens: 0,
+          cache_creation_tokens: 0,
+          reasoning_tokens: 0,
+          total_tokens: 100,
+          latency_ms: 250,
+          failed: false,
+        },
       ],
       [
         {
-          id: 'gpt-4o',
-          label: 'gpt-4o',
-          model: 'gpt-4o',
+          id: 'deepseek-v4-flash',
+          label: 'deepseek-v4-flash',
+          model: 'deepseek-v4-flash',
           requestCount: 10,
           successCount: 10,
           failureCount: 0,
@@ -1062,7 +1275,7 @@ describe('usage analytics adapters', () => {
 
     expect(rows[0]).toMatchObject({
       eventHash: 'event-a',
-      model: 'gpt-4o',
+      model: 'deepseek-v4-flash',
       estimatedCost: 0.2,
       headerErrorKind: 'rate_limit',
       headerErrorCode: 'retry_after',
@@ -1071,14 +1284,19 @@ describe('usage analytics adapters', () => {
       headerQuotaUsedPercent: 87,
       headerQuotaRecoverAtMs: 1780000060000,
     });
+    expect(rows[1]).toMatchObject({
+      eventHash: 'event-b',
+      model: 'deepseek-v4-flash',
+      estimatedCost: 0.2,
+    });
   });
 });
 
 describe('cache hit rate', () => {
-  it('uses total input (input + cacheRead + cacheCreation) as the denominator for Anthropic usage', () => {
+  it('uses normalized total input as the denominator for Anthropic usage', () => {
     expect(
       computeCacheHitRate({
-        inputTokens: 100,
+        inputTokens: 450,
         cacheReadTokens: 300,
         cacheCreationTokens: 50,
         cachedTokens: 0,
@@ -1095,6 +1313,18 @@ describe('cache hit rate', () => {
         cachedTokens: 400,
       })
     ).toBeCloseTo(0.4, 6);
+  });
+
+  it('does not double count GPT-5.6 fine-grained cache tokens', () => {
+    expect(
+      computeCacheHitRate({
+        modelName: 'openai/gpt-5.6-sol',
+        inputTokens: 152_600,
+        cacheReadTokens: 151_000,
+        cacheCreationTokens: 1_000,
+        cachedTokens: 0,
+      })
+    ).toBeCloseTo(151_000 / 152_600, 6);
   });
 
   it('returns 0 without input and clamps malformed ratios to 1', () => {
@@ -1140,7 +1370,7 @@ describe('model rank derivations', () => {
   it('derives per-row cache hit rate and average cost per call', () => {
     const row = rankRow({
       requestCount: 50,
-      inputTokens: 100,
+      inputTokens: 450,
       cacheReadTokens: 300,
       cacheCreationTokens: 50,
       estimatedCost: 10,
@@ -1148,6 +1378,32 @@ describe('model rank derivations', () => {
     expect(computeRowCacheHitRate(row)).toBeCloseTo(300 / 450, 6);
     expect(computeRowAverageCostPerCall(row)).toBeCloseTo(0.2, 6);
     expect(computeRowAverageCostPerCall(rankRow({ estimatedCost: 10 }))).toBe(0);
+  });
+
+  it('uses model-aware cache semantics for GPT-5.6 rank rows', () => {
+    const row = rankRow({
+      model: 'gpt-5.6-sol',
+      label: 'gpt-5.6-sol',
+      inputTokens: 152_600,
+      cacheReadTokens: 151_000,
+      cacheCreationTokens: 1_000,
+    });
+    expect(computeRowCacheHitRate(row)).toBeCloseTo(151_000 / 152_600, 6);
+  });
+
+  it('uses server-normalized cache totals when a display alias hides GPT-5.6', () => {
+    const row = rankRow({
+      model: 'internal-fast',
+      label: 'internal-fast',
+      inputTokens: 152_600,
+      cacheReadTokens: 151_000,
+      cacheCreationTokens: 1_000,
+      cacheHitTokens: 151_000,
+      cacheHitInputTokens: 152_600,
+      cacheHitRate: 151_000 / 152_600,
+    });
+    expect(computeRowCacheHitRate(row)).toBeCloseTo(151_000 / 152_600, 6);
+    expect(computeRowCacheHitRate(rankRow({ models: [row] }))).toBeCloseTo(151_000 / 152_600, 6);
   });
 
   it('builds the reverse key distribution for a model from API key breakdowns', () => {
@@ -1251,6 +1507,41 @@ describe('usage anomaly drilldown', () => {
         averageTokensPerRequest: 0,
       })
     ).toEqual(['usage_analytics.cause_request_drop', 'usage_analytics.cause_cost_drop']);
+  });
+
+  it('detects cache growth from fine-grained cache buckets', () => {
+    const timeline = buildUsageTimeline(
+      [
+        {
+          bucket_ms: NOW_MS,
+          label: '',
+          calls: 1,
+          tokens: 100,
+          success: 1,
+          failure: 0,
+          input_tokens: 100,
+          cache_read_tokens: 10,
+          cache_creation_tokens: 0,
+        },
+        {
+          bucket_ms: NOW_MS + HOUR_MS,
+          label: '',
+          calls: 1,
+          tokens: 100,
+          success: 1,
+          failure: 0,
+          input_tokens: 100,
+          cache_read_tokens: 25,
+          cache_creation_tokens: 5,
+        },
+      ],
+      'hour'
+    );
+
+    const analysis = analyzeUsageBucket(timeline, NOW_MS + HOUR_MS);
+
+    expect(analysis?.changes.cachedTokens).toBe(2);
+    expect(analysis?.causeKeys).toContain('usage_analytics.cause_cache_growth');
   });
 
   it('builds stable monitoring detail query parameters', () => {
