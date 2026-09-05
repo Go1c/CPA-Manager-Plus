@@ -5409,18 +5409,29 @@ export function AccountsPage() {
     selectedRowKey,
   ]);
 
+  const getResettableCodexQuota = useCallback(
+    (row: AccountRow) =>
+      row.provider === CODEX_CONFIG.type
+        ? mergeCodexResetCreditsFromQuotaSnapshots(
+            getDisplayCodexQuota(row.raw),
+            quotaSnapshotWindowsByRowKey.get(row.selectionKey) ?? []
+          )
+        : undefined,
+    [getDisplayCodexQuota, quotaSnapshotWindowsByRowKey]
+  );
+
   const canResetCodexQuota = useCallback(
     (row: AccountRow) => {
-      if (row.provider !== CODEX_CONFIG.type || row.disabled || row.runtimeOnly) return false;
-      return CODEX_CONFIG.canResetQuota?.(row.raw, getDisplayCodexQuota(row.raw)) === true;
+      if (row.provider !== CODEX_CONFIG.type || row.runtimeOnly) return false;
+      return CODEX_CONFIG.canResetQuota?.(row.raw, getResettableCodexQuota(row)) === true;
     },
-    [getDisplayCodexQuota]
+    [getResettableCodexQuota]
   );
 
   const resetCodexQuotaForRow = useCallback(
     (row: AccountRow) => {
       if (!canResetCodexQuota(row) || !CODEX_CONFIG.resetQuota) return;
-      const quota = getDisplayCodexQuota(row.raw);
+      const quota = getResettableCodexQuota(row);
       const storeKey = CODEX_CONFIG.getStoreKey?.(row.raw) ?? row.fileName;
       const resetCount = quota?.rateLimitResetCreditsAvailableCount ?? 0;
       const displayName = getDisplayAccount(row);
@@ -5488,7 +5499,7 @@ export function AccountsPage() {
     [
       canResetCodexQuota,
       getDisplayAccount,
-      getDisplayCodexQuota,
+      getResettableCodexQuota,
       setCodexQuota,
       showConfirmation,
       showNotification,
@@ -6861,13 +6872,7 @@ export function AccountsPage() {
       previousCycle: definition.previousCycle,
     }));
     const selectedQuotaCooldown = quotaCooldownsByRowKey.get(selectedRow.selectionKey)?.[0] ?? null;
-    const selectedCodexQuota =
-      selectedRow.provider === CODEX_CONFIG.type
-        ? mergeCodexResetCreditsFromQuotaSnapshots(
-            getDisplayCodexQuota(selectedRow.raw),
-            quotaSnapshotWindowsByRowKey.get(selectedRow.selectionKey) ?? []
-          )
-        : undefined;
+    const selectedCodexQuota = getResettableCodexQuota(selectedRow);
     const selectedCodexStatus = codexStatusBySelectionKey.get(selectedRow.selectionKey) ?? null;
     const hasMatchingDetailEvents = detailEventsRowKey === selectedRow.selectionKey;
     const rowEvents = hasMatchingDetailEvents ? detailEvents : [];
