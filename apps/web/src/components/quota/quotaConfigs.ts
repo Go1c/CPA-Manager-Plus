@@ -643,8 +643,7 @@ export const CODEX_CONFIG: QuotaConfig<CodexQuotaState, CodexQuotaData> = {
   scopeState: scopeCredentialQuotaState,
   buildObservedState: buildObservedCodexQuotaState,
   resetQuota: resetCodexQuota,
-  canResetQuota: (_file, quota) =>
-    quota?.status === 'success' && (quota.rateLimitResetCreditsAvailableCount ?? 0) > 0,
+  canResetQuota: (_file, quota) => (quota?.rateLimitResetCreditsAvailableCount ?? 0) > 0,
 };
 
 export const KIMI_CONFIG: QuotaConfig<KimiQuotaState, KimiQuotaData> = {

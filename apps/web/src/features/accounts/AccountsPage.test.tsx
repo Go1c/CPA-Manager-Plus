@@ -10650,6 +10650,119 @@ describe('AccountsPage replacement flows', () => {
     expect(mocks.showConfirmation).not.toHaveBeenCalled();
   });
 
+  it('allows Codex quota reset when the account is disabled but reset credits remain', async () => {
+    const resetCreditExpiresAtMs = Date.now() + 24 * 60 * 60 * 1000;
+    mocks.files = [
+      {
+        ...makeCodexFile('codex.json', 'auth-1', 'codex@example.com'),
+        disabled: true,
+      },
+    ];
+    mocks.quotaState.codexQuota = {
+      'codex.json': {
+        status: 'success',
+        authFileKey: 'codex.json::auth-1',
+        windows: [],
+        rateLimitResetCreditsAvailableCount: 2,
+        rateLimitResetCredits: [
+          {
+            id: 'reset-credit-disabled',
+            status: 'available',
+            grantedAt: new Date(resetCreditExpiresAtMs - 24 * 60 * 60 * 1000).toISOString(),
+            expiresAt: new Date(resetCreditExpiresAtMs).toISOString(),
+          },
+        ],
+      },
+    };
+
+    const renderer = await renderAccountsPage();
+
+    await act(async () => {
+      findDetailButtonByName(renderer, 'codex.json').props.onClick();
+    });
+    await flushPromises();
+    await act(async () => {
+      findHostButtonByText(renderer, 'accounts.detail_tab_quota').props.onClick();
+    });
+    await flushPromises();
+
+    const resetAction = renderer.root.findByProps({ 'data-quota-reset-action': 'true' });
+    expect(resetAction.props.disabled).toBe(false);
+    await act(async () => {
+      resetAction.props.onClick();
+    });
+    expect(mocks.showConfirmation).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'codex_quota.reset_confirm_title' })
+    );
+  });
+
+  it('enables Codex quota reset from persisted reset-credit snapshots', async () => {
+    const file = makeCodexFile('codex.json', 'auth-1', 'codex@example.com');
+    const rowKey = getAuthFileSelectionKey(file);
+    const resetCreditExpiresAtMs = Date.now() + 24 * 60 * 60 * 1000;
+    mocks.panelFeatureAvailability = {
+      checking: false,
+      managerServiceBase: 'http://manager.local:18317',
+      requestMonitoringAvailable: true,
+      serverCodexInspectionAvailable: false,
+    };
+    mocks.quotaState.codexQuota = {
+      'codex.json': {
+        status: 'idle',
+        authFileKey: 'codex.json::auth-1',
+        windows: [],
+      },
+    };
+    vi.mocked(accountQuotaSnapshotApi.query).mockResolvedValue({
+      generated_at_ms: Date.now(),
+      items: [
+        {
+          row_key: rowKey,
+          account_key: rowKey,
+          provider: 'codex',
+          windows: [
+            {
+              provider_window_id: 'five-hour',
+              window_kind: 'five_hour',
+              window_mode: 'fixed',
+              model_scope_kind: 'all',
+              source: 'api_query',
+              observed_at_ms: Date.now(),
+              boundary_accuracy: 'exact',
+              used_percent: 40,
+              remaining_percent: 60,
+              stale: false,
+              reset_credits_available: 2,
+              reset_credits: [{ id: 'snapshot-credit', expires_at_ms: resetCreditExpiresAtMs }],
+              field_sources: {
+                reset_credits_available: { source: 'api_query', observed_at_ms: Date.now() },
+                reset_credits: { source: 'api_query', observed_at_ms: Date.now() },
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const renderer = await renderAccountsPage();
+
+    await act(async () => {
+      findDetailButtonByName(renderer, 'codex.json').props.onClick();
+    });
+    await flushPromises();
+    await act(async () => {
+      findHostButtonByText(renderer, 'accounts.detail_tab_quota').props.onClick();
+    });
+    await flushPromises();
+    await flushPromises();
+
+    const resetAction = renderer.root.findByProps({ 'data-quota-reset-action': 'true' });
+    expect(resetAction.props.disabled).toBe(false);
+    expect(readText(renderer.root.findByProps({ 'data-quota-reset-count': 'true' }))).toContain(
+      '2'
+    );
+  });
+
   it('loads detail events filtered by auth file and auth index', async () => {
     mocks.panelFeatureAvailability = {
       checking: false,
